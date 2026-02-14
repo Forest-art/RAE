@@ -74,6 +74,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-split", type=str, default="train", help="HuggingFace dataset split.")
     parser.add_argument("--hf-cache-dir", type=str, default=None, help="HuggingFace dataset cache directory.")
     parser.add_argument("--hf-load-from-disk", type=str, default=None, help="Load dataset from local disk path (using datasets.load_from_disk).")
+    # HuggingFace eval dataset options
+    parser.add_argument("--use-hf-eval", action="store_true", help="Use HuggingFace dataset for evaluation.")
+    parser.add_argument("--hf-eval-split", type=str, default="validation", help="HuggingFace eval dataset split.")
+    parser.add_argument("--hf-eval-load-from-disk", type=str, default=None, help="Load eval dataset from local disk path.")
     args = parser.parse_args()
     
     # Validate that either data-path or use-hf is provided
@@ -228,7 +232,11 @@ def main():
         eval_metrics = eval_section.get("metrics", ("rfid", "psnr", "ssim")) # by default eval all
         eval_data = eval_section.get("data_path", None)
         reference_npz_path = eval_section.get("reference_npz_path", None)
-        assert eval_data, "eval.data_path must be specified to enable evaluation."
+        # Check if using HF eval - either via command line args or config
+        use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
+        if not use_hf_eval:
+            # Only require data_path for non-HF eval
+            assert eval_data, "eval.data_path must be specified to enable evaluation (unless using --use-hf-eval)."
         assert reference_npz_path, "eval.reference_npz_path must be specified to enable evaluation."
         assert len(eval_metrics) > 0, "eval.metrics must contain at least one metric to compute."
     else:
@@ -343,14 +351,42 @@ def main():
             args.data_path, batch_size, num_workers, rank, world_size, transform=stage1_transform
         )
     if do_eval:
-        eval_dataset = ImageFolder(
-            str(eval_data),
-            transform=transforms.Compose([
-                transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-                transforms.ToTensor(),
-            ])
-        )
-        logger.info(f"Evaluation dataset loaded from {eval_data}, containing {len(eval_dataset)} images.")
+        # Determine eval transform
+        eval_transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+            transforms.ToTensor(),
+        ])
+        
+        # Check if we should use HuggingFace for eval
+        use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
+        
+        if use_hf_eval:
+            # Load eval dataset from HuggingFace
+            if args.hf_eval_load_from_disk:
+                if rank == 0:
+                    logger.info(f"Loading evaluation dataset from disk: {args.hf_eval_load_from_disk}, split: {args.hf_eval_split}")
+                hf_eval_dataset = load_dataset_from_hf(
+                    load_from_disk_path=args.hf_eval_load_from_disk,
+                    split=args.hf_eval_split
+                )
+            else:
+                # Use same source as training but with eval split
+                if rank == 0:
+                    logger.info(f"Loading evaluation dataset from HuggingFace: {args.hf_dataset_name}, split: {args.hf_eval_split}")
+                hf_eval_dataset = load_dataset_from_hf(
+                    dataset_name=args.hf_dataset_name,
+                    split=args.hf_eval_split,
+                    cache_dir=args.hf_cache_dir
+                )
+            eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
+            logger.info(f"Evaluation dataset loaded: {len(eval_dataset)} samples")
+        else:
+            # Load eval dataset from local ImageFolder
+            eval_dataset = ImageFolder(
+                str(eval_data),
+                transform=eval_transform
+            )
+            logger.info(f"Evaluation dataset loaded from {eval_data}, containing {len(eval_dataset)} images.")
     
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:

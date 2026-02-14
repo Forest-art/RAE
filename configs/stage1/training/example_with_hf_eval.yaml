@@ -8,10 +8,8 @@ stage_1:
       dinov2_path: 'facebook/dinov2-with-registers-base'
       normalize: true
     decoder_config_path: 'configs/decoder/ViTXL'
-    noise_tau: 0.8 # training 0.8, at inference time always set to 0
+    noise_tau: 0.8
     reshape_to_2d: true
-    #normalization_stat_path: 'models/stats/dinov2/wReg_base/imagenet1k/stat.pt'
-
 
 training:
   epochs: 16
@@ -20,7 +18,7 @@ training:
   num_workers: 8
   clip_grad: 0.0
   log_interval: 100
-  checkpoint_interval: 1 # every 1 epoch
+  checkpoint_interval: 1
   sample_every: 2500
   optimizer:
     lr: 2.0e-4
@@ -34,22 +32,19 @@ training:
     final_lr: 2.0e-5
     warmup_from_zero: true
 
-# 在线评估配置
-# 使用方式：
-#   1. 本地 ImageFolder 验证集：不需要 --use-hf-eval，会自动使用此处的 data_path
-#   2. HuggingFace 验证集：添加 --use-hf-eval --hf-eval-load-from-disk PATH --hf-eval-split validation
-#      此时 data_path 会被忽略
+# 启用在线评估 - 使用 HuggingFace 验证集
 eval:
-  eval_interval: 2500        # 每 2500 个 step 评估一次
-  eval_model: true           # 同时评估非 EMA 模型
-  # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 验证集路径（使用 HF 时可省略）
-  reference_npz_path: 'data/imagenet/VIRTUAL_imagenet256_labeled.npz'  # 标准 ImageNet 参考文件
-  metrics: ['psnr', 'ssim', 'rfid']  # 评估指标：PSNR, SSIM, 重建 FID
+  eval_interval: 2500
+  eval_model: true
+  # 注意：使用 --use-hf-eval 时，不需要配置 data_path
+  # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 方式时使用
+  reference_npz_path: 'data/imagenet/VIRTUAL_imagenet256_labeled.npz'
+  metrics: ['psnr', 'ssim', 'rfid']
 
 gan:
   disc:
     arch:
-      dino_ckpt_path: '../models/discs/dino_vit_small_patch8_224.pth'
+      dino_ckpt_path: 'models/discs/dino_vit_small_patch8_224.pth'
       ks: 9
       norm_type: 'bn'
       using_spec_norm: true
@@ -78,4 +73,3 @@ gan:
     lpips_start: 0
     max_d_weight: 10000.0
     disc_updates: 1
-    

@@ -104,7 +104,8 @@ def evaluate_generation_distributed(
         os.makedirs(temp_dir, exist_ok=True)
 
     # Wait for rank 0 to create the directory before other ranks try to save
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
     # print(f"[Rank {rank}] Starting sampling...")
     # Each rank processes its shard
     N = min(len(val_dataset), num_samples)
@@ -160,7 +161,8 @@ def evaluate_generation_distributed(
         print(f"[Rank {rank}] Saved {len(generations)} generation to {shard_path}")
 
     # Wait for all ranks to finish generation
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
 
     # Rank 0 computes metrics
     metrics = None
@@ -204,7 +206,8 @@ def evaluate_generation_distributed(
             if os.path.exists(shard_file):
                 os.remove(shard_file)
 
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
     return metrics
 @torch.no_grad()
 def evaluate_reconstruction_distributed(
@@ -249,7 +252,8 @@ def evaluate_reconstruction_distributed(
         os.makedirs(temp_dir, exist_ok=True)
 
     # Wait for rank 0 to create the directory before other ranks try to save
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
     # print(f"[Rank {rank}] Starting reconstruction...")
     # Each rank processes its shard
     N = min(len(val_dataset), num_samples)
@@ -299,7 +303,8 @@ def evaluate_reconstruction_distributed(
         print(f"[Rank {rank}] Saved {len(reconstructions)} reconstructions to {shard_path}")
 
     # Wait for all ranks to finish reconstruction
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
 
     # Rank 0 computes metrics
     metrics = None
@@ -345,7 +350,8 @@ def evaluate_reconstruction_distributed(
             if os.path.exists(shard_file):
                 os.remove(shard_file)
 
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
     # model.train()
 
     return metrics
