@@ -9,7 +9,6 @@ pretrained_models
 /models/
 __pycache__/
 *.pth
-.cache/
 /checkpoints/
 upload_to_hf.py
 /*.png
