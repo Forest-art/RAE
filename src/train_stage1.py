@@ -16,7 +16,7 @@ import os
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-dataset-name", type=str, default="imagenet-1k", help="HuggingFace dataset name.")
     parser.add_argument("--hf-split", type=str, default="train", help="HuggingFace dataset split.")
     parser.add_argument("--hf-cache-dir", type=str, default=None, help="HuggingFace dataset cache directory.")
+    parser.add_argument("--hf-load-from-disk", type=str, default=None, help="Load dataset from local disk path (using datasets.load_from_disk).")
     return parser.parse_args()
 
 
@@ -110,7 +111,7 @@ def save_checkpoint(
     path: str,
     step: int,
     epoch: int,
-    model: DDP,
+    model: Union[DDP, torch.nn.Module],
     ema_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[LambdaLR],
@@ -118,15 +119,17 @@ def save_checkpoint(
     disc_optimizer: torch.optim.Optimizer,
     disc_scheduler: Optional[LambdaLR],
 ) -> None:
+    # Handle both DDP and non-DDP models
+    model_state = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
     state = {
         "step": step,
         "epoch": epoch,
-        "model": model.module.state_dict(),
+        "model": model_state,
         "ema": ema_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        "disc": disc.state_dict(),
-        "disc_optimizer": disc_optimizer.state_dict(),
+        "disc": disc.state_dict() if disc is not None else None,
+        "disc_optimizer": disc_optimizer.state_dict() if disc_optimizer is not None else None,
         "disc_scheduler": disc_scheduler.state_dict() if disc_scheduler is not None else None,
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -135,7 +138,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     path: str,
-    model: DDP,
+    model: Union[DDP, torch.nn.Module],
     ema_model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[LambdaLR],
@@ -144,13 +147,19 @@ def load_checkpoint(
     disc_scheduler: Optional[LambdaLR],
 ) -> Tuple[int, int]:
     checkpoint = torch.load(path, map_location="cpu")
-    model.module.load_state_dict(checkpoint["model"])
+    # Handle both DDP and non-DDP models
+    if isinstance(model, DDP):
+        model.module.load_state_dict(checkpoint["model"])
+    else:
+        model.load_state_dict(checkpoint["model"])
     ema_model.load_state_dict(checkpoint["ema"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     if scheduler is not None and checkpoint.get("scheduler") is not None:
         scheduler.load_state_dict(checkpoint["scheduler"])
-    disc.load_state_dict(checkpoint["disc"])
-    disc_optimizer.load_state_dict(checkpoint["disc_optimizer"])
+    if disc is not None and checkpoint.get("disc") is not None:
+        disc.load_state_dict(checkpoint["disc"])
+    if disc_optimizer is not None and checkpoint.get("disc_optimizer") is not None:
+        disc_optimizer.load_state_dict(checkpoint["disc_optimizer"])
     if disc_scheduler is not None and checkpoint.get("disc_scheduler") is not None:
         disc_scheduler.load_state_dict(checkpoint["disc_scheduler"])
     return checkpoint.get("epoch", 0), checkpoint.get("step", 0)
@@ -241,16 +250,35 @@ def main():
     # only train decoder
     rae.encoder.requires_grad_(False)
     rae.decoder.requires_grad_(True)
-    ddp_model = DDP(rae, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False)  # type: ignore[arg-type]
-    rae = ddp_model.module
-    decoder = ddp_model.module.decoder
-    discriminator, disc_aug = build_discriminator(disc_cfg, device)
-    ddp_disc = DDP(discriminator, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False)  # type: ignore[arg-type]
-    discriminator = ddp_disc.module
+    
+    # Use DDP only in distributed mode
+    if world_size > 1:
+        ddp_model = DDP(rae, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False)  # type: ignore[arg-type]
+        rae = ddp_model.module
+        decoder = ddp_model.module.decoder
+    else:
+        ddp_model = rae
+        decoder = rae.decoder
+    # Initialize discriminator only if it will be used
+    if disc_weight > 0:
+        discriminator, disc_aug = build_discriminator(disc_cfg, device)
+        if world_size > 1:
+            ddp_disc = DDP(discriminator, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False)  # type: ignore[arg-type]
+            discriminator = ddp_disc.module
+        else:
+            ddp_disc = discriminator
+    else:
+        # Create dummy discriminator and augmentation for code compatibility
+        discriminator = None
+        ddp_disc = None
+        disc_aug = None
     disc_scheduler: LambdaLR | None = None
     disc_sched_msg: Optional[str] = None
 
-    discriminator.train()
+    if discriminator is not None:
+        discriminator.train()
+    else:
+        logger.info("Skipping discriminator training (discriminator is None)")
     disc_loss_fn, gen_loss_fn = select_gan_losses(disc_loss_type, gen_loss_type)
     
     lpips = LPIPS().to(device)
@@ -258,8 +286,13 @@ def main():
     
     #### Opt, Schedl init
     optimizer, optim_msg = build_optimizer(decoder.parameters(), training_cfg)
-    disc_params = [p for p in discriminator.parameters() if p.requires_grad]
-    disc_optimizer, disc_optim_msg = build_optimizer(disc_params, disc_cfg)
+    if discriminator is not None:
+        disc_params = [p for p in discriminator.parameters() if p.requires_grad]
+        disc_optimizer, disc_optim_msg = build_optimizer(disc_params, disc_cfg)
+    else:
+        # Create dummy optimizer for code compatibility
+        disc_optimizer = None
+        disc_optim_msg = "No discriminator optimizer (disc_weight=0)"
     
     #### AMP init
     scaler, autocast_kwargs = get_autocast_scaler(args)
@@ -276,14 +309,22 @@ def main():
     )    
     
     if args.use_hf:
-        # Load from HuggingFace
-        if rank == 0:
-            logger.info(f"Loading HuggingFace dataset: {args.hf_dataset_name}, split: {args.hf_split}")
-        hf_dataset = load_dataset_from_hf(
-            dataset_name=args.hf_dataset_name,
-            split=args.hf_split,
-            cache_dir=args.hf_cache_dir
-        )
+        # Load from HuggingFace or local disk
+        if args.hf_load_from_disk:
+            if rank == 0:
+                logger.info(f"Loading dataset from disk: {args.hf_load_from_disk}, split: {args.hf_split}")
+            hf_dataset = load_dataset_from_hf(
+                load_from_disk_path=args.hf_load_from_disk,
+                split=args.hf_split
+            )
+        else:
+            if rank == 0:
+                logger.info(f"Loading HuggingFace dataset: {args.hf_dataset_name}, split: {args.hf_split}")
+            hf_dataset = load_dataset_from_hf(
+                dataset_name=args.hf_dataset_name,
+                split=args.hf_split,
+                cache_dir=args.hf_cache_dir
+            )
         dataset = HFImageNetDataset(hf_dataset, transform=stage1_transform)
         loader, sampler = prepare_hf_dataloader(
             dataset, batch_size, num_workers, rank, world_size
@@ -314,7 +355,7 @@ def main():
     sched_msg: Optional[str] = None
     if training_cfg.get("scheduler"):
         scheduler, sched_msg = build_scheduler(optimizer, steps_per_epoch, training_cfg)
-    if disc_cfg.get("scheduler"):
+    if disc_cfg.get("scheduler") and disc_optimizer is not None:
         disc_scheduler, disc_sched_msg = build_scheduler(disc_optimizer, steps_per_epoch, disc_cfg)
     
     ### Resuming and checkpointing
@@ -348,9 +389,12 @@ def main():
     if rank == 0:
         num_params = sum(p.numel() for p in ddp_model.parameters() if p.requires_grad)
         logger.info(f"Stage-1 RAE trainable parameters: {num_params/1e6:.2f}M")
-        logger.info(f"Discriminator architecture:\n{discriminator}")
-        num_params = sum(p.numel() for p in discriminator.parameters() if p.requires_grad)
-        logger.info(f"Discriminator trainable parameters: {num_params/1e6:.2f}M")
+        if discriminator is not None:
+            logger.info(f"Discriminator architecture:\n{discriminator}")
+            num_params = sum(p.numel() for p in discriminator.parameters() if p.requires_grad)
+            logger.info(f"Discriminator trainable parameters: {num_params/1e6:.2f}M")
+        else:
+            logger.info("Discriminator: None (disc_weight=0)")
         logger.info(f"Using {disc_loss_type} discriminator loss and {gen_loss_type} generator loss.")
         logger.info(f"Perceptual (LPIPS) weight: {perceptual_weight:.6f}, GAN weight: {disc_weight:.6f}")
         logger.info(f"GAN training starts at epoch {gan_start_epoch}, discriminator updates start at epoch {disc_update_epoch}, LPIPS loss starts at epoch {lpips_start_epoch}.")
@@ -376,7 +420,8 @@ def main():
     gan_start_step = gan_start_epoch * steps_per_epoch
     disc_update_step = disc_update_epoch * steps_per_epoch
     lpips_start_step = lpips_start_epoch * steps_per_epoch
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
     for epoch in range(start_epoch, num_epochs):
         ddp_model.train()
         sampler.set_epoch(epoch)
@@ -404,7 +449,8 @@ def main():
             images = images.to(device, non_blocking=True)
             real_normed = images * 2.0 - 1.0
             optimizer.zero_grad(set_to_none=True)
-            discriminator.eval()
+            if discriminator is not None:
+                discriminator.eval()
             with autocast(**autocast_kwargs):
                 recon = ddp_model(images) # keep gradient synced
                 recon_normed = recon * 2.0 - 1.0
@@ -446,7 +492,9 @@ def main():
             if scheduler is not None:
                 scheduler.step()
 
-            update_ema(ema_model, ddp_model.module, ema_decay)
+            # Get the underlying module for both DDP and non-DDP models
+            model_for_ema = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+            update_ema(ema_model, model_for_ema, ema_decay)
 
             disc_metrics: Dict[str, torch.Tensor] = {}
             if train_disc:
@@ -539,7 +587,8 @@ def main():
                 logger.info("Starting evaluation...")
                 eval_models = [(ema_model, "ema")]
                 if eval_model:
-                    eval_models.append((ddp_model.module, "model"))
+                    model_for_eval = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+                    eval_models.append((model_for_eval, "model"))
                 for eval_mod, mod_name in eval_models:
                     eval_stats = evaluate_reconstruction_distributed(
                         eval_mod,
@@ -603,7 +652,8 @@ def main():
             disc_optimizer,
             disc_scheduler,
         )
-    dist.barrier()
+    if world_size > 1:
+        dist.barrier()
     logger.info("Done!")
     cleanup_distributed()
 

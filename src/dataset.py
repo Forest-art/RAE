@@ -43,24 +43,35 @@ class HFImageNetDataset(Dataset):
             return self.__getitem__((idx + 1) % len(self.dataset))
 
 
-def load_dataset_from_hf(dataset_name="imagenet-1k", split="train", cache_dir=None):
+def load_dataset_from_hf(dataset_name="imagenet-1k", split="train", cache_dir=None, token=None, load_from_disk_path=None):
     """
-    Load ImageNet dataset from HuggingFace.
+    Load ImageNet dataset from HuggingFace or from local disk.
     
     Args:
         dataset_name: Name of the dataset on HuggingFace (default: imagenet-1k)
         split: Dataset split to load (train/validation)
         cache_dir: Optional cache directory for downloaded data
+        token: HuggingFace API token for gated datasets (e.g., ImageNet)
+        load_from_disk_path: Path to locally saved dataset (using datasets.save_to_disk)
         
     Returns:
         HuggingFace dataset object
     """
-    from datasets import load_dataset
+    from datasets import load_dataset, load_from_disk
     
-    dataset = load_dataset(
-        dataset_name,
-        split=split,
-        cache_dir=cache_dir,
-        trust_remote_code=True
-    )
-    return dataset
+    if load_from_disk_path is not None:
+        # Load from local disk
+        dataset = load_from_disk(load_from_disk_path)
+        # Handle split if the loaded dataset is a DatasetDict
+        if hasattr(dataset, 'keys') and split in dataset:
+            dataset = dataset[split]
+        return dataset
+    else:
+        # Load from HuggingFace Hub
+        dataset = load_dataset(
+            dataset_name,
+            split=split,
+            cache_dir=cache_dir,
+            token=token
+        )
+        return dataset
