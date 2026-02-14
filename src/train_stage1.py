@@ -62,7 +62,7 @@ import numpy as np
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Stage-1 RAE with GAN and LPIPS losses.")
     parser.add_argument("--config", type=str, required=True, help="YAML config containing a stage_1 section.")
-    parser.add_argument("--data-path", type=Path, required=True, help="Directory with ImageFolder structure.")
+    parser.add_argument("--data-path", type=Path, default=None, help="Directory with ImageFolder structure. Required unless using --use-hf.")
     parser.add_argument("--results-dir", type=str, default="ckpts", help="Directory to store training outputs.")
     parser.add_argument("--image-size", type=int, default=256, help="Image resolution (assumes square images).")
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
@@ -74,7 +74,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf-split", type=str, default="train", help="HuggingFace dataset split.")
     parser.add_argument("--hf-cache-dir", type=str, default=None, help="HuggingFace dataset cache directory.")
     parser.add_argument("--hf-load-from-disk", type=str, default=None, help="Load dataset from local disk path (using datasets.load_from_disk).")
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # Validate that either data-path or use-hf is provided
+    if args.data_path is None and not args.use_hf:
+        parser.error("--data-path is required unless using --use-hf")
+    
+    return args
 
 
 def calculate_adaptive_weight(
