@@ -33,6 +33,11 @@ from dataset import HFImageNetDataset, load_dataset_from_hf
 from torchvision.utils import make_grid
 from omegaconf import OmegaConf
 from eval import evaluate_reconstruction_distributed
+# Import online FID directly to avoid circular import issues
+try:
+    from eval.online_fid import evaluate_reconstruction_online_fid, HAS_ONLINE_FID as HAS_TORCHMETRICS
+except ImportError:
+    HAS_TORCHMETRICS = False
 from disc import (
     DiffAug,
     LPIPS,
@@ -632,20 +637,42 @@ def main():
                     model_for_eval = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
                     eval_models.append((model_for_eval, "model"))
                 for eval_mod, mod_name in eval_models:
-                    eval_stats = evaluate_reconstruction_distributed(
-                        eval_mod,
-                        eval_dataset,
-                        len(eval_dataset),
-                        rank = rank,
-                        world_size = world_size,
-                        device = device,
-                        batch_size = batch_size,
-                        metrics_to_compute = eval_metrics,
-                        experiment_dir = experiment_dir,
-                        global_step = global_step,
-                        autocast_kwargs = autocast_kwargs,
-                        reference_npz_path = reference_npz_path
-                    )
+                    # 选择使用 online FID 或传统的 NPZ 方式
+                    use_online_fid = eval_section.get("use_online_fid", False) if eval_section else False
+                    
+                    if use_online_fid and HAS_TORCHMETRICS and "rfid" in eval_metrics:
+                        # 使用在线 FID（不保存 NPZ）
+                        logger.info(f"Using online FID evaluation for {mod_name}")
+                        eval_stats = evaluate_reconstruction_online_fid(
+                            eval_mod,
+                            eval_dataset,
+                            len(eval_dataset),
+                            batch_size = batch_size,
+                            rank = rank,
+                            world_size = world_size,
+                            device = device,
+                            global_step = global_step,
+                            autocast_kwargs = autocast_kwargs,
+                            metrics_to_compute = eval_metrics,
+                        )
+                    else:
+                        # 使用传统的 NPZ 方式
+                        if use_online_fid and not HAS_TORCHMETRICS:
+                            logger.warning("Online FID requested but torchmetrics not available, falling back to NPZ mode")
+                        eval_stats = evaluate_reconstruction_distributed(
+                            eval_mod,
+                            eval_dataset,
+                            len(eval_dataset),
+                            rank = rank,
+                            world_size = world_size,
+                            device = device,
+                            batch_size = batch_size,
+                            metrics_to_compute = eval_metrics,
+                            experiment_dir = experiment_dir,
+                            global_step = global_step,
+                            autocast_kwargs = autocast_kwargs,
+                            reference_npz_path = reference_npz_path
+                        )
                     # log with prefix
                     if eval_stats is not None:
                         eval_stats_prefixed = {f"eval_{mod_name}/{k}": v for k, v in eval_stats.items()}
