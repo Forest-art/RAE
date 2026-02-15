@@ -39,12 +39,21 @@ def _calculate_fid_from_features(real_features: torch.Tensor, fake_features: tor
     if not HAS_SCIPY:
         raise ImportError("scipy is required for FID calculation")
     
-    # Calculate mean and covariance
-    mu_real = real_features.mean(dim=0).cpu().numpy()
-    mu_fake = fake_features.mean(dim=0).cpu().numpy()
+    # Check minimum samples
+    if real_features.size(0) < 2 or fake_features.size(0) < 2:
+        print(f"[Warning] Insufficient samples for FID calculation: real={real_features.size(0)}, fake={fake_features.size(0)}")
+        return -1.0
     
-    sigma_real = torch.cov(real_features.T).cpu().numpy()
-    sigma_fake = torch.cov(fake_features.T).cpu().numpy()
+    # Convert to numpy
+    real_features = real_features.cpu().numpy()
+    fake_features = fake_features.cpu().numpy()
+    
+    # Calculate mean and covariance
+    mu_real = real_features.mean(axis=0)
+    mu_fake = fake_features.mean(axis=0)
+    
+    sigma_real = np.cov(real_features, rowvar=False)
+    sigma_fake = np.cov(fake_features, rowvar=False)
     
     # Calculate FID
     mu_real = np.asarray(mu_real, dtype=np.float64)
@@ -109,6 +118,9 @@ class OnlineFIDMetric:
         Returns:
             features: [B, 2048]
         """
+        # Make a copy to avoid modifying original
+        images = images.clone()
+        
         # Convert to uint8 [0, 255] as expected by torch_fidelity
         if images.max() <= 1.5:
             images = (images * 255.0).clamp(0, 255)
@@ -119,7 +131,9 @@ class OnlineFIDMetric:
         if images.dtype != torch.uint8:
             images = images.to(torch.uint8)
         
-        features = self.feature_extractor(images)[0]  # [B, 2048]
+        # Extract features without autocast (InceptionV3 expects float32)
+        with torch.cuda.amp.autocast(enabled=False):
+            features = self.feature_extractor(images)[0]  # [B, 2048]
         return features.detach()
     
     @torch.no_grad()
@@ -145,30 +159,64 @@ class OnlineFIDMetric:
             FID score (float), synchronized across all ranks in distributed setting
         """
         # Concatenate all features on this rank
-        real_feats = torch.cat(self.real_features, dim=0) if self.real_features else torch.empty(0, self.feature_dim)
-        fake_feats = torch.cat(self.fake_features, dim=0) if self.fake_features else torch.empty(0, self.feature_dim)
+        real_feats = torch.cat(self.real_features, dim=0) if self.real_features else torch.empty(0, self.feature_dim, device=self.device)
+        fake_feats = torch.cat(self.fake_features, dim=0) if self.fake_features else torch.empty(0, self.feature_dim, device=self.device)
+        
+        # Ensure tensors are on the correct device
+        real_feats = real_feats.to(self.device)
+        fake_feats = fake_feats.to(self.device)
         
         # In distributed mode, gather features from all ranks
         if self.world_size > 1:
-            # Gather features from all ranks to rank 0
-            gathered_real = [torch.empty_like(real_feats) for _ in range(self.world_size)]
-            gathered_fake = [torch.empty_like(fake_feats) for _ in range(self.world_size)]
+            # First, gather the sizes from all ranks
+            local_size = torch.tensor([real_feats.size(0)], device=self.device)
+            sizes = [torch.empty(1, dtype=torch.long, device=self.device) for _ in range(self.world_size)]
+            dist.all_gather(sizes, local_size)
+            sizes = [int(s.item()) for s in sizes]
+            max_size = max(sizes)
             
-            dist.all_gather(gathered_real, real_feats.to(self.device))
-            dist.all_gather(gathered_fake, fake_feats.to(self.device))
+            # Pad tensors to max size
+            real_feats_padded = torch.zeros(max_size, self.feature_dim, device=self.device)
+            fake_feats_padded = torch.zeros(max_size, self.feature_dim, device=self.device)
+            real_feats_padded[:real_feats.size(0)] = real_feats
+            fake_feats_padded[:fake_feats.size(0)] = fake_feats
             
-            if self.rank == 0:
-                real_feats = torch.cat(gathered_real, dim=0).cpu()
-                fake_feats = torch.cat(gathered_fake, dim=0).cpu()
-            else:
-                return -1.0  # Non-zero ranks return dummy value
+            # Gather padded features
+            gathered_real = [torch.empty(max_size, self.feature_dim, device=self.device) for _ in range(self.world_size)]
+            gathered_fake = [torch.empty(max_size, self.feature_dim, device=self.device) for _ in range(self.world_size)]
+            
+            dist.all_gather(gathered_real, real_feats_padded)
+            dist.all_gather(gathered_fake, fake_feats_padded)
+            
+            # Unpad and concatenate
+            all_real = []
+            all_fake = []
+            for i, size in enumerate(sizes):
+                all_real.append(gathered_real[i][:size])
+                all_fake.append(gathered_fake[i][:size])
+            
+            real_feats = torch.cat(all_real, dim=0).cpu()
+            fake_feats = torch.cat(all_fake, dim=0).cpu()
+        else:
+            real_feats = real_feats.cpu()
+            fake_feats = fake_feats.cpu()
         
-        # Calculate FID
+        # Calculate FID on all ranks (to avoid blocking)
+        fid_score = -1.0
         if self.rank == 0:
             if len(real_feats) == 0 or len(fake_feats) == 0:
-                return -1.0
-            return _calculate_fid_from_features(real_feats, fake_feats)
-        return -1.0
+                fid_score = -1.0
+            elif len(real_feats) < 2 or len(fake_feats) < 2:
+                print(f"[Warning] Not enough samples for FID: real={len(real_feats)}, fake={len(fake_feats)}")
+                fid_score = -1.0
+            else:
+                fid_score = _calculate_fid_from_features(real_feats, fake_feats)
+        
+        # Synchronize to ensure all ranks wait for rank 0
+        if self.world_size > 1:
+            dist.barrier()
+        
+        return fid_score
 
 
 # Flag to indicate availability
@@ -252,7 +300,11 @@ def evaluate_reconstruction_online_fid(
         for images, _ in iterator:
             images = images.to(device, non_blocking=True)
             
-            with torch.autocast(device_type=device.type, **autocast_kwargs):
+            # Forward pass with autocast if enabled
+            if autocast_kwargs.get('enabled', True):
+                with torch.autocast(device_type=device.type, **autocast_kwargs):
+                    recon = model(images)
+            else:
                 recon = model(images)
             
             # Clamp to [0, 1]
