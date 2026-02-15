@@ -344,50 +344,44 @@ def main():
             args.data_path, batch_size, num_workers, rank, world_size, transform=stage1_transform
         )
     if do_eval:
-        # Determine eval transform
-        eval_transform = transforms.Compose([
-            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-            transforms.ToTensor(),
-        ])
-        
-        # Check if we should use HuggingFace for eval
-        use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
-        
-        if use_hf_eval:
-            # Load eval dataset from HuggingFace
-            if args.hf_eval_load_from_disk:
-                if rank == 0:
-                    logger.info(f"Loading evaluation dataset from disk: {args.hf_eval_load_from_disk}, split: {args.hf_eval_split}")
-                hf_eval_dataset = load_dataset_from_hf(
-                    load_from_disk_path=args.hf_eval_load_from_disk,
-                    split=args.hf_eval_split
-                )
-            else:
-                if rank == 0:
-                    logger.info(f"Loading evaluation dataset from HuggingFace: {args.hf_dataset_name}, split: {args.hf_eval_split}")
-                hf_eval_dataset = load_dataset_from_hf(
-                    dataset_name=args.hf_dataset_name,
-                    split=args.hf_eval_split,
-                    cache_dir=args.hf_cache_dir
-                )
-            eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
-        else:
-            # Load eval dataset from local ImageFolder
-            eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
-        
-        # Create eval dataloader (distributed)
-        eval_sampler = DistributedSampler(eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=batch_size,
-            sampler=eval_sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
-        
+        # Create eval dataloader only on rank 0
         if rank == 0:
-            logger.info(f"Evaluation dataset loaded: {len(eval_dataset)} samples, {len(eval_loader)} batches per rank")
+            eval_transform = transforms.Compose([
+                transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+                transforms.ToTensor(),
+            ])
+            
+            use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
+            
+            if use_hf_eval:
+                if args.hf_eval_load_from_disk:
+                    logger.info(f"Loading eval dataset from disk: {args.hf_eval_load_from_disk}")
+                    hf_eval_dataset = load_dataset_from_hf(
+                        load_from_disk_path=args.hf_eval_load_from_disk,
+                        split=args.hf_eval_split
+                    )
+                else:
+                    logger.info(f"Loading eval dataset from HF: {args.hf_dataset_name}")
+                    hf_eval_dataset = load_dataset_from_hf(
+                        dataset_name=args.hf_dataset_name,
+                        split=args.hf_eval_split,
+                        cache_dir=args.hf_cache_dir
+                    )
+                eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
+            else:
+                eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
+            
+            eval_loader = DataLoader(
+                eval_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+                drop_last=False,
+            )
+            logger.info(f"Eval dataset loaded: {len(eval_dataset)} samples, {len(eval_loader)} batches")
+        else:
+            eval_loader = None
     
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
@@ -626,37 +620,32 @@ def main():
                     if args.wandb:
                         wandb_utils.log_image(grid, step=global_step)
                 logger.info("Generating EMA samples done.")
-            # Evaluation: compute rFID only
+            # Evaluation: compute rFID only (on rank 0 only)
             if do_eval and global_step > 0 and (eval_interval > 0 and global_step % eval_interval == 0):
-                logger.info("Starting rFID evaluation...")
-                
-                # Setup FID metric
-                fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-                
-                # Compute rFID
-                ema_model.eval()
-                eval_sampler.set_epoch(global_step)  # Ensure consistent ordering
-                with torch.inference_mode():
-                    for images, _ in eval_loader:
-                        images = images.to(device, non_blocking=True)
-                        with autocast(**autocast_kwargs):
-                            recon = ema_model(images)
-                        recon = recon.clamp(0, 1)
-                        fid_metric.update(images, real=True)
-                        fid_metric.update(recon, real=False)
-                ema_model.train()
-                
-                # Synchronize and compute
-                if world_size > 1:
-                    dist.barrier()
-                
                 if rank == 0:
+                    logger.info("Starting rFID evaluation on rank 0...")
+                    fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+                    
+                    ema_model.eval()
+                    with torch.inference_mode():
+                        for images, _ in eval_loader:
+                            images = images.to(device, non_blocking=True)
+                            with autocast(**autocast_kwargs):
+                                recon = ema_model(images)
+                            recon = recon.clamp(0, 1)
+                            fid_metric.update(images, real=True)
+                            fid_metric.update(recon, real=False)
+                    ema_model.train()
+                    
                     rfid_val = float(fid_metric.compute().item())
                     logger.info(f"[Eval EMA] Step {global_step}: rFID: {rfid_val:.4f}")
                     if args.wandb:
                         wandb_utils.log({"eval_ema/rfid": rfid_val}, step=global_step)
+                    logger.info("rFID evaluation done.")
                 
-                logger.info("rFID evaluation done.")
+                # Synchronize all ranks
+                if world_size > 1:
+                    dist.barrier()
             global_step += 1
         if rank == 0 and num_batches > 0:
             avg_recon = (epoch_metrics["recon"] / num_batches).item()
