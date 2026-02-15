@@ -33,7 +33,9 @@ from dataset import HFImageNetDataset, load_dataset_from_hf
 from torchvision.utils import make_grid
 from omegaconf import OmegaConf
 # Evaluation imports
-from torchmetrics.image.fid import FrechetInceptionDistance
+# rFID imports
+from eval.fid import _compute_inception_moments_from_arr, _fid_from_moments
+from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
 from disc import (
     DiffAug,
     LPIPS,
@@ -627,51 +629,97 @@ def main():
                     if args.wandb:
                         wandb_utils.log_image(grid, step=global_step)
                 logger.info("Generating EMA samples done.")
-            # Evaluation: compute rFID only (on rank 0 only)
+            # Evaluation: compute rFID (distributed)
             if do_eval and global_step > 0 and (eval_interval > 0 and global_step % eval_interval == 0):
-                logger.info(f"[Rank {rank}] Entering eval block at step {global_step}")
                 if rank == 0:
-                    from tqdm import tqdm
-                    logger.info("Starting rFID evaluation on rank 0...")
-                    logger.info("Initializing FID metric (may take a moment)...")
-                    fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
-                    logger.info("FID metric initialized.")
+                    logger.info("Starting rFID evaluation...")
+                
+                # All ranks extract features from their shard
+                ema_model.eval()
+                real_features_list = []
+                fake_features_list = []
+                
+                # Initialize feature extractor on each rank
+                feature_extractor = FeatureExtractorInceptionV3(
+                    name="inception-v3-compat", features_list=['2048']
+                ).to(device).eval()
+                
+                with torch.inference_mode():
+                    for images, _ in eval_loader:
+                        images = images.to(device, non_blocking=True)
+                        with autocast(**autocast_kwargs):
+                            recon = ema_model(images)
+                        recon = recon.clamp(0, 1)
+                        
+                        # Convert to uint8 for feature extractor
+                        real_uint8 = (images * 255).byte()
+                        fake_uint8 = (recon * 255).byte()
+                        
+                        # Extract features
+                        real_feat = feature_extractor(real_uint8)[0]  # [B, 2048]
+                        fake_feat = feature_extractor(fake_uint8)[0]
+                        
+                        real_features_list.append(real_feat)
+                        fake_features_list.append(fake_feat)
+                
+                ema_model.train()
+                
+                # Concatenate features on this rank
+                real_features = torch.cat(real_features_list, dim=0) if real_features_list else torch.empty(0, 2048, device=device)
+                fake_features = torch.cat(fake_features_list, dim=0) if fake_features_list else torch.empty(0, 2048, device=device)
+                
+                # Gather features from all ranks to rank 0
+                if world_size > 1:
+                    # Gather sizes first
+                    real_size = torch.tensor([real_features.size(0)], device=device)
+                    fake_size = torch.tensor([fake_features.size(0)], device=device)
                     
-                    ema_model.eval()
-                    num_eval_batches = len(eval_loader)
-                    logger.info(f"Evaluating {num_eval_batches} batches...")
+                    sizes_real = [torch.empty(1, dtype=torch.long, device=device) for _ in range(world_size)]
+                    sizes_fake = [torch.empty(1, dtype=torch.long, device=device) for _ in range(world_size)]
                     
-                    with torch.inference_mode():
-                        for batch_idx, (images, _) in enumerate(tqdm(eval_loader, desc="Computing rFID", ncols=80)):
-                            images = images.to(device, non_blocking=True)
-                            with autocast(**autocast_kwargs):
-                                recon = ema_model(images)
-                            recon = recon.clamp(0, 1)
-                            
-                            # Debug: log first batch
-                            if batch_idx == 0:
-                                logger.info(f"First batch: images shape={images.shape}, range=[{images.min():.3f}, {images.max():.3f}]")
-                            
-                            fid_metric.update(images, real=True)
-                            fid_metric.update(recon, real=False)
-                    ema_model.train()
+                    dist.all_gather(sizes_real, real_size)
+                    dist.all_gather(sizes_fake, fake_size)
                     
-                    logger.info("Computing FID score...")
-                    rfid_val = float(fid_metric.compute().item())
+                    max_real = max([s.item() for s in sizes_real])
+                    max_fake = max([s.item() for s in sizes_fake])
+                    
+                    # Pad to max size
+                    real_padded = torch.zeros(max_real, 2048, device=device)
+                    fake_padded = torch.zeros(max_fake, 2048, device=device)
+                    real_padded[:real_features.size(0)] = real_features
+                    fake_padded[:fake_features.size(0)] = fake_features
+                    
+                    # Gather all features
+                    gathered_real = [torch.empty(max_real, 2048, device=device) for _ in range(world_size)]
+                    gathered_fake = [torch.empty(max_fake, 2048, device=device) for _ in range(world_size)]
+                    
+                    dist.all_gather(gathered_real, real_padded)
+                    dist.all_gather(gathered_fake, fake_padded)
+                    
+                    # Unpad on rank 0
+                    if rank == 0:
+                        all_real = []
+                        all_fake = []
+                        for i in range(world_size):
+                            all_real.append(gathered_real[i][:sizes_real[i].item()])
+                            all_fake.append(gathered_fake[i][:sizes_fake[i].item()])
+                        real_features = torch.cat(all_real, dim=0)
+                        fake_features = torch.cat(all_fake, dim=0)
+                
+                # Compute FID on rank 0
+                if rank == 0:
+                    mu_real = real_features.mean(dim=0).cpu().numpy()
+                    mu_fake = fake_features.mean(dim=0).cpu().numpy()
+                    sigma_real = torch.cov(real_features.T).cpu().numpy()
+                    sigma_fake = torch.cov(fake_features.T).cpu().numpy()
+                    
+                    rfid_val = _fid_from_moments(mu_real, sigma_real, mu_fake, sigma_fake)
                     logger.info(f"[Eval EMA] Step {global_step}: rFID: {rfid_val:.4f}")
                     if args.wandb:
                         wandb_utils.log({"eval_ema/rfid": rfid_val}, step=global_step)
-                    logger.info("rFID evaluation done.")
                 
-                elif world_size > 1:
-                    # Non-rank-0 ranks just wait
-                    logger.info(f"[Rank {rank}] Waiting at barrier for rFID eval...")
-                
-                # Synchronize all ranks
                 if world_size > 1:
-                    logger.info(f"[Rank {rank}] Reaching barrier...")
                     dist.barrier()
-                    logger.info(f"[Rank {rank}] Passed barrier.")
             global_step += 1
         if rank == 0 and num_batches > 0:
             avg_recon = (epoch_metrics["recon"] / num_batches).item()
