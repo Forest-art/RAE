@@ -648,8 +648,11 @@ def main():
                     name="inception-v3-compat", features_list=['2048']
                 ).to(device).eval()
                 
+                # Only show progress bar on rank 0
+                eval_iter = tqdm(eval_loader, desc=f"[Rank {rank}] rFID", ncols=80) if rank == 0 else eval_loader
+                
                 with torch.inference_mode():
-                    for images, _ in eval_loader:
+                    for images, _ in eval_iter:
                         images = images.to(device, non_blocking=True)
                         with autocast(**autocast_kwargs):
                             recon = ema_model(images)
