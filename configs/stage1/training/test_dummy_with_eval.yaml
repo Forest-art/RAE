@@ -32,13 +32,10 @@ training:
     final_lr: 1.0e-5
     warmup_from_zero: false
 
-# 启用在线评估 - rFID 评测
+# 评估配置
 eval:
-  eval_interval: 5          # 每 5 个 step 评估一次
-  eval_model: true          # 同时评估非 EMA 模型
-  data_path: './dummy_data/val/'        # 验证集图像路径
-  reference_npz_path: './dummy_val.npz' # 参考图像 NPZ 文件路径
-  metrics: ['psnr', 'ssim', 'rfid']     # 要计算的指标
+  eval_interval: 5
+  data_path: './dummy_data/val/'
 
 gan:
   disc:

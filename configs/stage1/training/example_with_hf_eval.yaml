@@ -32,14 +32,9 @@ training:
     final_lr: 2.0e-5
     warmup_from_zero: true
 
-# 启用在线评估 - 使用 HuggingFace 验证集
+# 评估配置
 eval:
   eval_interval: 2500
-  eval_model: true
-  # 注意：使用 --use-hf-eval 时，不需要配置 data_path
-  # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 方式时使用
-  reference_npz_path: 'data/imagenet/VIRTUAL_imagenet256_labeled.npz'
-  metrics: ['psnr', 'ssim', 'rfid']
 
 gan:
   disc:

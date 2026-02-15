@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
@@ -32,12 +32,8 @@ from dataset import HFImageNetDataset, load_dataset_from_hf
 
 from torchvision.utils import make_grid
 from omegaconf import OmegaConf
-from eval import evaluate_reconstruction_distributed
-# Import online FID directly to avoid circular import issues
-try:
-    from eval.online_fid import evaluate_reconstruction_online_fid, HAS_ONLINE_FID as HAS_TORCHMETRICS
-except ImportError:
-    HAS_TORCHMETRICS = False
+# Evaluation imports
+from torchmetrics.image.fid import FrechetInceptionDistance
 from disc import (
     DiffAug,
     LPIPS,
@@ -229,21 +225,13 @@ def main():
     num_epochs = int(training_cfg.get("epochs", 200))
     default_seed = int(training_cfg.get("global_seed", 0))
     eval_section = full_cfg.get("eval", None)
-    
     if eval_section:
         do_eval = True
         eval_interval = int(eval_section.get("eval_interval", 5000))
-        eval_model = eval_section.get("eval_model", False) # by default eval ema. This decides whether to **additionally** eval the non-ema model.
-        eval_metrics = eval_section.get("metrics", ("rfid", "psnr", "ssim")) # by default eval all
         eval_data = eval_section.get("data_path", None)
-        reference_npz_path = eval_section.get("reference_npz_path", None)
-        # Check if using HF eval - either via command line args or config
         use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
         if not use_hf_eval:
-            # Only require data_path for non-HF eval
             assert eval_data, "eval.data_path must be specified to enable evaluation (unless using --use-hf-eval)."
-        assert reference_npz_path, "eval.reference_npz_path must be specified to enable evaluation."
-        assert len(eval_metrics) > 0, "eval.metrics must contain at least one metric to compute."
     else:
         do_eval = False
     global_seed = args.global_seed if args.global_seed is not None else default_seed
@@ -375,7 +363,6 @@ def main():
                     split=args.hf_eval_split
                 )
             else:
-                # Use same source as training but with eval split
                 if rank == 0:
                     logger.info(f"Loading evaluation dataset from HuggingFace: {args.hf_dataset_name}, split: {args.hf_eval_split}")
                 hf_eval_dataset = load_dataset_from_hf(
@@ -384,14 +371,23 @@ def main():
                     cache_dir=args.hf_cache_dir
                 )
             eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
-            logger.info(f"Evaluation dataset loaded: {len(eval_dataset)} samples")
         else:
             # Load eval dataset from local ImageFolder
-            eval_dataset = ImageFolder(
-                str(eval_data),
-                transform=eval_transform
-            )
-            logger.info(f"Evaluation dataset loaded from {eval_data}, containing {len(eval_dataset)} images.")
+            eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
+        
+        # Create eval dataloader (distributed)
+        eval_sampler = DistributedSampler(eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=batch_size,
+            sampler=eval_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        
+        if rank == 0:
+            logger.info(f"Evaluation dataset loaded: {len(eval_dataset)} samples, {len(eval_loader)} batches per rank")
     
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
@@ -630,60 +626,37 @@ def main():
                     if args.wandb:
                         wandb_utils.log_image(grid, step=global_step)
                 logger.info("Generating EMA samples done.")
+            # Evaluation: compute rFID only
             if do_eval and global_step > 0 and (eval_interval > 0 and global_step % eval_interval == 0):
-                logger.info("Starting evaluation...")
-                eval_models = [(ema_model, "ema")]
-                if eval_model:
-                    model_for_eval = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
-                    eval_models.append((model_for_eval, "model"))
-                for eval_mod, mod_name in eval_models:
-                    # 选择使用 online FID 或传统的 NPZ 方式
-                    use_online_fid = eval_section.get("use_online_fid", False) if eval_section else False
-                    
-                    if use_online_fid and HAS_TORCHMETRICS and "rfid" in eval_metrics:
-                        # 使用在线 FID（不保存 NPZ）
-                        logger.info(f"Using online FID evaluation for {mod_name}")
-                        eval_stats = evaluate_reconstruction_online_fid(
-                            eval_mod,
-                            eval_dataset,
-                            len(eval_dataset),
-                            batch_size = batch_size,
-                            rank = rank,
-                            world_size = world_size,
-                            device = device,
-                            global_step = global_step,
-                            autocast_kwargs = autocast_kwargs,
-                            metrics_to_compute = eval_metrics,
-                        )
-                    else:
-                        # 使用传统的 NPZ 方式
-                        if use_online_fid and not HAS_TORCHMETRICS:
-                            logger.warning("Online FID requested but torchmetrics not available, falling back to NPZ mode")
-                        eval_stats = evaluate_reconstruction_distributed(
-                            eval_mod,
-                            eval_dataset,
-                            len(eval_dataset),
-                            rank = rank,
-                            world_size = world_size,
-                            device = device,
-                            batch_size = batch_size,
-                            metrics_to_compute = eval_metrics,
-                            experiment_dir = experiment_dir,
-                            global_step = global_step,
-                            autocast_kwargs = autocast_kwargs,
-                            reference_npz_path = reference_npz_path
-                        )
-                    # log with prefix
-                    if eval_stats is not None:
-                        eval_stats_prefixed = {f"eval_{mod_name}/{k}": v for k, v in eval_stats.items()}
-                        # 打印评估指标到日志
-                        logger.info(
-                            f"[Eval {mod_name.upper()}] Step {global_step}: "
-                            + ", ".join(f"{k}: {v:.4f}" for k, v in eval_stats.items())
-                        )
-                        if args.wandb:
-                            wandb_utils.log(eval_stats_prefixed, step=global_step)
-                logger.info("Evaluation done.")
+                logger.info("Starting rFID evaluation...")
+                
+                # Setup FID metric
+                fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+                
+                # Compute rFID
+                ema_model.eval()
+                eval_sampler.set_epoch(global_step)  # Ensure consistent ordering
+                with torch.inference_mode():
+                    for images, _ in eval_loader:
+                        images = images.to(device, non_blocking=True)
+                        with autocast(**autocast_kwargs):
+                            recon = ema_model(images)
+                        recon = recon.clamp(0, 1)
+                        fid_metric.update(images, real=True)
+                        fid_metric.update(recon, real=False)
+                ema_model.train()
+                
+                # Synchronize and compute
+                if world_size > 1:
+                    dist.barrier()
+                
+                if rank == 0:
+                    rfid_val = float(fid_metric.compute().item())
+                    logger.info(f"[Eval EMA] Step {global_step}: rFID: {rfid_val:.4f}")
+                    if args.wandb:
+                        wandb_utils.log({"eval_ema/rfid": rfid_val}, step=global_step)
+                
+                logger.info("rFID evaluation done.")
             global_step += 1
         if rank == 0 and num_batches > 0:
             avg_recon = (epoch_metrics["recon"] / num_batches).item()

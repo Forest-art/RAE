@@ -34,18 +34,10 @@ training:
     final_lr: 2.0e-5
     warmup_from_zero: true
 
-# 在线评估配置
-# 使用方式：
-#   1. 本地 ImageFolder 验证集：不需要 --use-hf-eval，会自动使用此处的 data_path
-#   2. HuggingFace 验证集：添加 --use-hf-eval --hf-eval-load-from-disk PATH --hf-eval-split validation
-#      此时 data_path 会被忽略
+# 评估配置
 eval:
-  eval_interval: 2500        # 每 2500 个 step 评估一次
-  eval_model: false          # 只评估 EMA 模型，不评估非 EMA 模型
-  use_online_fid: true       # 使用在线 FID 计算（边训边测，不保存 NPZ）
-  # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 验证集路径（使用 HF 时可省略）
-  reference_npz_path: '../VIRTUAL_imagenet256_labeled.npz'  # 标准 ImageNet 参考文件（online_fid 模式下不需要）
-  metrics: ['psnr', 'ssim', 'rfid']  # 评估指标：PSNR, SSIM, 重建 FID
+  eval_interval: 2500        # 每 2500 个 step 计算一次 rFID
+  # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 验证集路径
 
 gan:
   disc:
