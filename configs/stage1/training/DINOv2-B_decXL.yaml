@@ -41,7 +41,7 @@ training:
 #      此时 data_path 会被忽略
 eval:
   eval_interval: 2500        # 每 2500 个 step 评估一次
-  eval_model: true           # 同时评估非 EMA 模型
+  eval_model: false           # 同时评估非 EMA 模型
   # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 验证集路径（使用 HF 时可省略）
   reference_npz_path: '../VIRTUAL_imagenet256_labeled.npz'  # 标准 ImageNet 参考文件
   metrics: ['psnr', 'ssim', 'rfid']  # 评估指标：PSNR, SSIM, 重建 FID

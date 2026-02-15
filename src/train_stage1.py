@@ -625,7 +625,7 @@ def main():
                     if args.wandb:
                         wandb_utils.log_image(grid, step=global_step)
                 logger.info("Generating EMA samples done.")
-            if do_eval and (eval_interval > 0 and global_step % eval_interval == 0):
+            if do_eval and global_step > 0 and (eval_interval > 0 and global_step % eval_interval == 0):
                 logger.info("Starting evaluation...")
                 eval_models = [(ema_model, "ema")]
                 if eval_model:
