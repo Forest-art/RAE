@@ -347,50 +347,54 @@ def main():
         )
     if do_eval:
         max_eval_samples = eval_section.get("max_eval_samples", None) if eval_section else None
-        # Create eval dataloader only on rank 0
-        if rank == 0:
-            eval_transform = transforms.Compose([
-                transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
-                transforms.ToTensor(),
-            ])
-            
-            use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
-            
-            if use_hf_eval:
-                if args.hf_eval_load_from_disk:
+        
+        # All ranks create eval dataloader with DistributedSampler
+        eval_transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+            transforms.ToTensor(),
+        ])
+        
+        use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
+        
+        if use_hf_eval:
+            if args.hf_eval_load_from_disk:
+                if rank == 0:
                     logger.info(f"Loading eval dataset from disk: {args.hf_eval_load_from_disk}")
-                    hf_eval_dataset = load_dataset_from_hf(
-                        load_from_disk_path=args.hf_eval_load_from_disk,
-                        split=args.hf_eval_split
-                    )
-                else:
-                    logger.info(f"Loading eval dataset from HF: {args.hf_dataset_name}")
-                    hf_eval_dataset = load_dataset_from_hf(
-                        dataset_name=args.hf_dataset_name,
-                        split=args.hf_eval_split,
-                        cache_dir=args.hf_cache_dir
-                    )
-                eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
+                hf_eval_dataset = load_dataset_from_hf(
+                    load_from_disk_path=args.hf_eval_load_from_disk,
+                    split=args.hf_eval_split
+                )
             else:
-                eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
-            
-            # Optionally limit eval samples for faster computation
-            if max_eval_samples is not None and max_eval_samples < len(eval_dataset):
-                from torch.utils.data import Subset
-                eval_dataset = Subset(eval_dataset, range(max_eval_samples))
-                logger.info(f"Eval dataset limited to {max_eval_samples} samples")
-            
-            eval_loader = DataLoader(
-                eval_dataset,
-                batch_size=batch_size,
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=True,
-                drop_last=False,
-            )
-            logger.info(f"Eval dataset loaded: {len(eval_dataset)} samples, {len(eval_loader)} batches")
+                if rank == 0:
+                    logger.info(f"Loading eval dataset from HF: {args.hf_dataset_name}")
+                hf_eval_dataset = load_dataset_from_hf(
+                    dataset_name=args.hf_dataset_name,
+                    split=args.hf_eval_split,
+                    cache_dir=args.hf_cache_dir
+                )
+            eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
         else:
-            eval_loader = None
+            eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
+        
+        # Optionally limit eval samples (only on rank 0, then broadcast)
+        if rank == 0 and max_eval_samples is not None and max_eval_samples < len(eval_dataset):
+            from torch.utils.data import Subset
+            eval_dataset = Subset(eval_dataset, range(max_eval_samples))
+        
+        # Use DistributedSampler for parallel evaluation
+        eval_sampler = DistributedSampler(eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=batch_size,
+            sampler=eval_sampler,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+        
+        if rank == 0:
+            total_samples = len(eval_dataset)
+            logger.info(f"Eval dataset loaded: {total_samples} samples, {len(eval_loader)} batches per rank")
     
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
