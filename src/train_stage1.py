@@ -61,6 +61,7 @@ from utils.dist_utils import *
 from utils.train_utils import prepare_hf_dataloader
 from PIL import Image
 import numpy as np
+from tqdm import tqdm
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Stage-1 RAE with GAN and LPIPS losses.")
