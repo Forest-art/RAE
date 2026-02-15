@@ -344,6 +344,7 @@ def main():
             args.data_path, batch_size, num_workers, rank, world_size, transform=stage1_transform
         )
     if do_eval:
+        max_eval_samples = eval_section.get("max_eval_samples", None) if eval_section else None
         # Create eval dataloader only on rank 0
         if rank == 0:
             eval_transform = transforms.Compose([
@@ -370,6 +371,12 @@ def main():
                 eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
             else:
                 eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
+            
+            # Optionally limit eval samples for faster computation
+            if max_eval_samples is not None and max_eval_samples < len(eval_dataset):
+                from torch.utils.data import Subset
+                eval_dataset = Subset(eval_dataset, range(max_eval_samples))
+                logger.info(f"Eval dataset limited to {max_eval_samples} samples")
             
             eval_loader = DataLoader(
                 eval_dataset,
@@ -622,30 +629,49 @@ def main():
                 logger.info("Generating EMA samples done.")
             # Evaluation: compute rFID only (on rank 0 only)
             if do_eval and global_step > 0 and (eval_interval > 0 and global_step % eval_interval == 0):
+                logger.info(f"[Rank {rank}] Entering eval block at step {global_step}")
                 if rank == 0:
+                    from tqdm import tqdm
                     logger.info("Starting rFID evaluation on rank 0...")
+                    logger.info("Initializing FID metric (may take a moment)...")
                     fid_metric = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+                    logger.info("FID metric initialized.")
                     
                     ema_model.eval()
+                    num_eval_batches = len(eval_loader)
+                    logger.info(f"Evaluating {num_eval_batches} batches...")
+                    
                     with torch.inference_mode():
-                        for images, _ in eval_loader:
+                        for batch_idx, (images, _) in enumerate(tqdm(eval_loader, desc="Computing rFID", ncols=80)):
                             images = images.to(device, non_blocking=True)
                             with autocast(**autocast_kwargs):
                                 recon = ema_model(images)
                             recon = recon.clamp(0, 1)
+                            
+                            # Debug: log first batch
+                            if batch_idx == 0:
+                                logger.info(f"First batch: images shape={images.shape}, range=[{images.min():.3f}, {images.max():.3f}]")
+                            
                             fid_metric.update(images, real=True)
                             fid_metric.update(recon, real=False)
                     ema_model.train()
                     
+                    logger.info("Computing FID score...")
                     rfid_val = float(fid_metric.compute().item())
                     logger.info(f"[Eval EMA] Step {global_step}: rFID: {rfid_val:.4f}")
                     if args.wandb:
                         wandb_utils.log({"eval_ema/rfid": rfid_val}, step=global_step)
                     logger.info("rFID evaluation done.")
                 
+                elif world_size > 1:
+                    # Non-rank-0 ranks just wait
+                    logger.info(f"[Rank {rank}] Waiting at barrier for rFID eval...")
+                
                 # Synchronize all ranks
                 if world_size > 1:
+                    logger.info(f"[Rank {rank}] Reaching barrier...")
                     dist.barrier()
+                    logger.info(f"[Rank {rank}] Passed barrier.")
             global_step += 1
         if rank == 0 and num_batches > 0:
             avg_recon = (epoch_metrics["recon"] / num_batches).item()

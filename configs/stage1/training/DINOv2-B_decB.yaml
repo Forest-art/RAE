@@ -37,6 +37,7 @@ training:
 # 评估配置
 eval:
   eval_interval: 2500        # 每 2500 个 step 计算一次 rFID
+  max_eval_samples: 1000     # 最多计算多少张图片的 rFID（设为 null 或删除则计算全部）
   # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 验证集路径
 
 gan:
