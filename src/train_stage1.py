@@ -647,9 +647,15 @@ def main():
                         reference_npz_path = reference_npz_path
                     )
                     # log with prefix
-                    eval_stats = {f"eval_{mod_name}/{k}": v for k, v in eval_stats.items()} if eval_stats is not None else {}
-                    if args.wandb:
-                        wandb_utils.log(eval_stats, step=global_step)
+                    if eval_stats is not None:
+                        eval_stats_prefixed = {f"eval_{mod_name}/{k}": v for k, v in eval_stats.items()}
+                        # 打印评估指标到日志
+                        logger.info(
+                            f"[Eval {mod_name.upper()}] Step {global_step}: "
+                            + ", ".join(f"{k}: {v:.4f}" for k, v in eval_stats.items())
+                        )
+                        if args.wandb:
+                            wandb_utils.log(eval_stats_prefixed, step=global_step)
                 logger.info("Evaluation done.")
             global_step += 1
         if rank == 0 and num_batches > 0:
