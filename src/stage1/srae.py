@@ -291,18 +291,14 @@ class SRAE(nn.Module):
         x_full = torch.cat([x, mask_tokens], dim=1)  # [B, N, decoder_dim]
         
         # Unshuffle to original order
-        ids_shuffle = torch.argsort(ids_restore, dim=1)
-        x_full = torch.gather(x_full, dim=1, index=ids_shuffle.unsqueeze(-1).expand(-1, -1, x_full.size(-1)))
+        x_full = torch.gather(
+            x_full,
+            dim=1,
+            index=ids_restore.unsqueeze(-1).expand(-1, -1, x_full.size(-1)),
+        )
         
-        # Add positional embeddings
-        x_full = x_full + self.decoder_pos_embed[:, 1:, :]  # Exclude CLS position
-        
-        # Add CLS token
-        cls_token = self.mask_token.expand(B, 1, -1) + self.decoder_pos_embed[:, :1, :]
-        x_full = torch.cat([cls_token, x_full], dim=1)  # [B, N+1, decoder_dim]
-        
-        # Pass through decoder
-        outputs = self.decoder(x_full)
+        # Pass through decoder. GeneralDecoder handles CLS token and positional embeddings.
+        outputs = self.decoder(x_full, drop_cls_token=False)
         logits = outputs.logits  # [B, N, patch_dim]
         
         return logits
@@ -316,6 +312,27 @@ class SRAE(nn.Module):
             img: [B, 3, H, W]
         """
         return self.decoder.unpatchify(x)
+
+    def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
+        """
+        Convert images to patch targets for reconstruction loss.
+        Args:
+            imgs: [B, C, H, W]
+        Returns:
+            patches: [B, N, patch_size^2 * C]
+        """
+        p = self.patch_size
+        B, C, H, W = imgs.shape
+        if H % p != 0 or W % p != 0:
+            raise ValueError(
+                f"Input resolution ({H}, {W}) must be divisible by patch_size {p}."
+            )
+
+        h = H // p
+        w = W // p
+        patches = imgs.reshape(B, C, h, p, w, p)
+        patches = patches.permute(0, 2, 4, 3, 5, 1).reshape(B, h * w, p * p * C)
+        return patches
     
     def forward_loss(self, imgs: torch.Tensor, pred: torch.Tensor, mask: torch.Tensor,
                      z_proj: torch.Tensor, teacher_feat: torch.Tensor, z: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -325,12 +342,16 @@ class SRAE(nn.Module):
         - loss_align: Cosine similarity between student projector and teacher
         - loss_reg: L2 regularization on bottleneck
         """
-        B = imgs.size(0)
-        
         # 1. Reconstruction loss (MSE on masked patches only)
         # Target: patchify the original image
-        target = self.student_encoder.embeddings.patch_embeddings.projection(imgs)
-        target = target.flatten(2).transpose(1, 2)  # [B, N, patch_dim]
+        if imgs.shape[-2:] != (self.img_size, self.img_size):
+            imgs = F.interpolate(
+                imgs,
+                size=(self.img_size, self.img_size),
+                mode='bicubic',
+                align_corners=False,
+            )
+        target = self.patchify(imgs)  # [B, N, patch_size^2 * 3]
         
         # Normalize target (similar to MAE)
         mean = target.mean(dim=-1, keepdim=True)

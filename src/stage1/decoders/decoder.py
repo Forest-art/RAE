@@ -745,5 +745,3 @@ class GeneralDecoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
         )
-
-

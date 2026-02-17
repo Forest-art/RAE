@@ -224,13 +224,9 @@ def main():
     else:
         disc_optimizer = None
     
-    # Schedulers
+    # Schedulers (initialized after steps_per_epoch is known)
     scheduler = None
     disc_scheduler = None
-    if training_cfg.get("scheduler"):
-        scheduler, _ = build_scheduler(optimizer, steps_per_epoch, training_cfg)
-    if disc_cfg.get("scheduler") and disc_optimizer is not None:
-        disc_scheduler, _ = build_scheduler(disc_optimizer, steps_per_epoch, disc_cfg)
     
     # AMP
     scaler, autocast_kwargs = get_autocast_scaler(args)
@@ -271,7 +267,7 @@ def main():
         else:
             eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
         
-        if rank == 0 and max_eval_samples is not None and max_eval_samples < len(eval_dataset):
+        if max_eval_samples is not None and max_eval_samples < len(eval_dataset):
             from torch.utils.data import Subset
             eval_dataset = Subset(eval_dataset, range(max_eval_samples))
         
@@ -280,6 +276,14 @@ def main():
                                 num_workers=num_workers, pin_memory=True, drop_last=False)
     
     steps_per_epoch = len(loader)
+    if steps_per_epoch == 0:
+        raise RuntimeError("Dataloader returned zero batches. Check dataset and batch size settings.")
+
+    if training_cfg.get("scheduler"):
+        scheduler, _ = build_scheduler(optimizer, steps_per_epoch, training_cfg)
+    if disc_cfg.get("scheduler") and disc_optimizer is not None:
+        disc_scheduler, _ = build_scheduler(disc_optimizer, steps_per_epoch, disc_cfg)
+
     gan_start_step = gan_start_epoch * steps_per_epoch
     disc_update_step = disc_update_epoch * steps_per_epoch
     lpips_start_step = lpips_start_epoch * steps_per_epoch
@@ -320,6 +324,8 @@ def main():
                 loss_rec = losses.get('loss_rec', (recon - images).abs().mean())
                 loss_align = losses.get('loss_align', torch.zeros(1, device=device))
                 loss_reg = losses.get('loss_reg', torch.zeros(1, device=device))
+                loss_align_weight = float(getattr(model, "loss_align_weight", 1.0))
+                loss_reg_weight = float(getattr(model, "loss_reg_weight", 1.0))
                 
                 # LPIPS loss
                 if use_lpips:
@@ -350,7 +356,7 @@ def main():
                     total_loss = recon_total
                 
                 # Add S-RAE specific losses
-                total_loss = total_loss + loss_align + loss_reg
+                total_loss = total_loss + loss_align_weight * loss_align + loss_reg_weight * loss_reg
             
             # Backward
             if scaler:

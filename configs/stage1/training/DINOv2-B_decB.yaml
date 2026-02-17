@@ -34,16 +34,17 @@ training:
     final_lr: 2.0e-5
     warmup_from_zero: true
 
-# 评估配置
-eval:
-  eval_interval: 2500        # 每 2500 个 step 计算一次 rFID
-  max_eval_samples: 1000     # 最多计算多少张图片的 rFID（设为 null 或删除则计算全部）
-  # data_path: 'data/imagenet/val/'  # 本地 ImageFolder 验证集路径
+# eval:
+#   eval_interval: 2500
+#   eval_model: true
+#   data_path: 'data/imagenet/val/'
+#   reference_npz_path: 'data/imagenet/val_256.npz'
+#   metrics: ['psnr', 'ssim', 'rfid']
 
 gan:
   disc:
     arch:
-      dino_ckpt_path: '../models/discs/dino_vit_small_patch8_224.pth'
+      dino_ckpt_path: 'models/discs/dino_vit_small_patch8_224.pth'
       ks: 9
       norm_type: 'bn'
       using_spec_norm: true

@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
@@ -32,10 +32,7 @@ from dataset import HFImageNetDataset, load_dataset_from_hf
 
 from torchvision.utils import make_grid
 from omegaconf import OmegaConf
-# Evaluation imports
-# rFID imports
-from eval.fid import _compute_inception_moments_from_arr, _fid_from_moments
-from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
+from eval import evaluate_reconstruction_distributed
 from disc import (
     DiffAug,
     LPIPS,
@@ -47,10 +44,6 @@ from disc import (
 from stage1 import RAE
 
 ##### general utils
-import sys
-import os
-# Add src directory to path to ensure correct imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from utils import wandb_utils
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import *
@@ -61,7 +54,6 @@ from utils.dist_utils import *
 from utils.train_utils import prepare_hf_dataloader
 from PIL import Image
 import numpy as np
-from tqdm import tqdm
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Stage-1 RAE with GAN and LPIPS losses.")
@@ -231,10 +223,15 @@ def main():
     if eval_section:
         do_eval = True
         eval_interval = int(eval_section.get("eval_interval", 5000))
+        eval_model = eval_section.get("eval_model", False)  # additionally eval non-EMA model
+        eval_metrics = eval_section.get("metrics", ("rfid", "psnr", "ssim"))
         eval_data = eval_section.get("data_path", None)
+        reference_npz_path = eval_section.get("reference_npz_path", None)
         use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
         if not use_hf_eval:
             assert eval_data, "eval.data_path must be specified to enable evaluation (unless using --use-hf-eval)."
+        assert reference_npz_path, "eval.reference_npz_path must be specified to enable evaluation."
+        assert len(eval_metrics) > 0, "eval.metrics must contain at least one metric to compute."
     else:
         do_eval = False
     global_seed = args.global_seed if args.global_seed is not None else default_seed
@@ -349,7 +346,6 @@ def main():
     if do_eval:
         max_eval_samples = eval_section.get("max_eval_samples", None) if eval_section else None
         
-        # All ranks create eval dataloader with DistributedSampler
         eval_transform = transforms.Compose([
             transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
             transforms.ToTensor(),
@@ -377,25 +373,14 @@ def main():
         else:
             eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
         
-        # Optionally limit eval samples (only on rank 0, then broadcast)
-        if rank == 0 and max_eval_samples is not None and max_eval_samples < len(eval_dataset):
+        # Optionally limit eval samples (must be identical on all ranks)
+        if max_eval_samples is not None and max_eval_samples < len(eval_dataset):
             from torch.utils.data import Subset
             eval_dataset = Subset(eval_dataset, range(max_eval_samples))
-        
-        # Use DistributedSampler for parallel evaluation
-        eval_sampler = DistributedSampler(eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        eval_loader = DataLoader(
-            eval_dataset,
-            batch_size=batch_size,
-            sampler=eval_sampler,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
-        
+
         if rank == 0:
             total_samples = len(eval_dataset)
-            logger.info(f"Eval dataset loaded: {total_samples} samples, {len(eval_loader)} batches per rank")
+            logger.info(f"Evaluation dataset loaded, containing {total_samples} images.")
     
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
@@ -634,100 +619,31 @@ def main():
                     if args.wandb:
                         wandb_utils.log_image(grid, step=global_step)
                 logger.info("Generating EMA samples done.")
-            # Evaluation: compute rFID (distributed)
-            if do_eval and global_step > 0 and (eval_interval > 0 and global_step % eval_interval == 0):
-                if rank == 0:
-                    logger.info("Starting rFID evaluation...")
-                
-                # All ranks extract features from their shard
-                ema_model.eval()
-                real_features_list = []
-                fake_features_list = []
-                
-                # Initialize feature extractor on each rank
-                feature_extractor = FeatureExtractorInceptionV3(
-                    name="inception-v3-compat", features_list=['2048']
-                ).to(device).eval()
-                
-                # Only show progress bar on rank 0
-                eval_iter = tqdm(eval_loader, desc=f"[Rank {rank}] rFID", ncols=80) if rank == 0 else eval_loader
-                
-                with torch.inference_mode():
-                    for images, _ in eval_iter:
-                        images = images.to(device, non_blocking=True)
-                        with autocast(**autocast_kwargs):
-                            recon = ema_model(images)
-                        recon = recon.clamp(0, 1)
-                        
-                        # Convert to uint8 for feature extractor
-                        real_uint8 = (images * 255).byte()
-                        fake_uint8 = (recon * 255).byte()
-                        
-                        # Extract features
-                        real_feat = feature_extractor(real_uint8)[0]  # [B, 2048]
-                        fake_feat = feature_extractor(fake_uint8)[0]
-                        
-                        real_features_list.append(real_feat)
-                        fake_features_list.append(fake_feat)
-                
-                ema_model.train()
-                
-                # Concatenate features on this rank
-                real_features = torch.cat(real_features_list, dim=0) if real_features_list else torch.empty(0, 2048, device=device)
-                fake_features = torch.cat(fake_features_list, dim=0) if fake_features_list else torch.empty(0, 2048, device=device)
-                
-                # Gather features from all ranks to rank 0
-                if world_size > 1:
-                    # Gather sizes first
-                    real_size = torch.tensor([real_features.size(0)], device=device)
-                    fake_size = torch.tensor([fake_features.size(0)], device=device)
-                    
-                    sizes_real = [torch.empty(1, dtype=torch.long, device=device) for _ in range(world_size)]
-                    sizes_fake = [torch.empty(1, dtype=torch.long, device=device) for _ in range(world_size)]
-                    
-                    dist.all_gather(sizes_real, real_size)
-                    dist.all_gather(sizes_fake, fake_size)
-                    
-                    max_real = max([s.item() for s in sizes_real])
-                    max_fake = max([s.item() for s in sizes_fake])
-                    
-                    # Pad to max size
-                    real_padded = torch.zeros(max_real, 2048, device=device)
-                    fake_padded = torch.zeros(max_fake, 2048, device=device)
-                    real_padded[:real_features.size(0)] = real_features
-                    fake_padded[:fake_features.size(0)] = fake_features
-                    
-                    # Gather all features
-                    gathered_real = [torch.empty(max_real, 2048, device=device) for _ in range(world_size)]
-                    gathered_fake = [torch.empty(max_fake, 2048, device=device) for _ in range(world_size)]
-                    
-                    dist.all_gather(gathered_real, real_padded)
-                    dist.all_gather(gathered_fake, fake_padded)
-                    
-                    # Unpad on rank 0
-                    if rank == 0:
-                        all_real = []
-                        all_fake = []
-                        for i in range(world_size):
-                            all_real.append(gathered_real[i][:sizes_real[i].item()])
-                            all_fake.append(gathered_fake[i][:sizes_fake[i].item()])
-                        real_features = torch.cat(all_real, dim=0)
-                        fake_features = torch.cat(all_fake, dim=0)
-                
-                # Compute FID on rank 0
-                if rank == 0:
-                    mu_real = real_features.mean(dim=0).cpu().numpy()
-                    mu_fake = fake_features.mean(dim=0).cpu().numpy()
-                    sigma_real = torch.cov(real_features.T).cpu().numpy()
-                    sigma_fake = torch.cov(fake_features.T).cpu().numpy()
-                    
-                    rfid_val = _fid_from_moments(mu_real, sigma_real, mu_fake, sigma_fake)
-                    logger.info(f"[Eval EMA] Step {global_step}: rFID: {rfid_val:.4f}")
+            if do_eval and (eval_interval > 0 and global_step % eval_interval == 0):
+                logger.info("Starting evaluation...")
+                eval_models = [(ema_model, "ema")]
+                if eval_model:
+                    current_model = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+                    eval_models.append((current_model, "model"))
+                for eval_mod, mod_name in eval_models:
+                    eval_stats = evaluate_reconstruction_distributed(
+                        eval_mod,
+                        eval_dataset,
+                        len(eval_dataset),
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                        batch_size=batch_size,
+                        metrics_to_compute=eval_metrics,
+                        experiment_dir=experiment_dir,
+                        global_step=global_step,
+                        autocast_kwargs=autocast_kwargs,
+                        reference_npz_path=reference_npz_path,
+                    )
+                    eval_stats = {f"eval_{mod_name}/{k}": v for k, v in eval_stats.items()} if eval_stats is not None else {}
                     if args.wandb:
-                        wandb_utils.log({"eval_ema/rfid": rfid_val}, step=global_step)
-                
-                if world_size > 1:
-                    dist.barrier()
+                        wandb_utils.log(eval_stats, step=global_step)
+                logger.info("Evaluation done.")
             global_step += 1
         if rank == 0 and num_batches > 0:
             avg_recon = (epoch_metrics["recon"] / num_batches).item()
