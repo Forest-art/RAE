@@ -35,7 +35,10 @@ training:
 # 评估配置
 eval:
   eval_interval: 2500
+  eval_model: true
   metrics: ['psnr', 'ssim', 'rfid']
+  # For local ImageFolder eval, set data_path; for HF eval, pass --use-hf-eval.
+  # data_path: 'data/imagenet/val/'
 
 periodic_eval:
   every_steps: 2500

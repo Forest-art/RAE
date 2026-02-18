@@ -35,6 +35,7 @@ training:
 # 评估配置
 eval:
   eval_interval: 5
+  eval_model: true
   data_path: './dummy_data/val/'
   metrics: ['psnr', 'ssim', 'rfid']
 

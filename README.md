@@ -135,6 +135,36 @@ Notes:
 - Add `--compile` to enable `torch.compile` on model forward/encode.
 - You can use HuggingFace dataset mode with `--use-hf` and related flags.
 
+### Stage-1 RAE (HF `load_from_disk` + Online Full Eval)
+
+Complete training command with HuggingFace local dataset loading, full online eval (no `reference_npz_path`), and full periodic eval:
+
+```bash
+export EXPERIMENT_NAME=rae_dino_decb_hf_full_eval_$(date +%Y%m%d_%H%M%S)
+
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/train_stage1.py \
+  --config configs/stage1/training/DINOv2-B_decB.yaml \
+  --use-hf \
+  --hf-load-from-disk /path/to/hf_imagenet \
+  --hf-split train \
+  --use-hf-eval \
+  --hf-eval-load-from-disk /path/to/hf_imagenet \
+  --hf-eval-split validation \
+  --results-dir ckpts/stage1 \
+  --image-size 256 \
+  --precision bf16 \
+  --eval-every-steps 2500 \
+  --eval-split val \
+  --eval-num-samples -1
+```
+
+Notes:
+
+- `--hf-load-from-disk` expects a dataset saved with `datasets.save_to_disk` (Dataset or DatasetDict).
+- Full eval can run online from the eval dataset directly; `eval.reference_npz_path` is optional.
+- `--eval-num-samples -1` means periodic eval uses the full selected split.
+
 ## Stage-1 SRAE Training
 
 ```bash
