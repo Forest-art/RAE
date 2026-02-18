@@ -36,6 +36,12 @@ training:
 eval:
   eval_interval: 5
   data_path: './dummy_data/val/'
+  metrics: ['psnr', 'ssim', 'rfid']
+
+periodic_eval:
+  every_steps: 5
+  split: train
+  num_samples: -1  # <=0 means full split
 
 gan:
   disc:

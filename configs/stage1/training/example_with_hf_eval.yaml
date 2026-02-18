@@ -35,6 +35,12 @@ training:
 # 评估配置
 eval:
   eval_interval: 2500
+  metrics: ['psnr', 'ssim', 'rfid']
+
+periodic_eval:
+  every_steps: 2500
+  split: val
+  num_samples: -1  # <=0 means full split
 
 gan:
   disc:

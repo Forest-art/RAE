@@ -34,6 +34,11 @@ training:
     final_lr: 2.0e-5
     warmup_from_zero: true
 
+periodic_eval:
+  every_steps: 2500
+  split: val
+  num_samples: -1  # <=0 means full split
+
 # eval:
 #   eval_interval: 2500
 #   eval_model: true

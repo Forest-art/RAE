@@ -75,19 +75,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-hf-eval", action="store_true", help="Use HuggingFace dataset for evaluation.")
     parser.add_argument("--hf-eval-split", type=str, default="validation", help="HuggingFace eval dataset split.")
     parser.add_argument("--hf-eval-load-from-disk", type=str, default=None, help="Load eval dataset from local disk path.")
-    parser.add_argument("--eval-every-steps", type=int, default=0, help="Run lightweight periodic rFID every N steps (0 disables).")
-    parser.add_argument("--eval-num-samples", type=int, default=32, help="Number of samples used for periodic rFID evaluation.")
-    parser.add_argument("--eval-split", type=str, choices=["val", "train", "dummy"], default="val", help="Dataset split used for periodic rFID.")
+    parser.add_argument("--eval-every-steps", type=int, default=None, help="Run lightweight periodic rFID every N steps (0 disables). Defaults to periodic_eval.every_steps in config when omitted.")
+    parser.add_argument("--eval-num-samples", type=int, default=None, help="Samples for periodic rFID. Use <=0 for full split. Defaults to periodic_eval.num_samples in config when omitted.")
+    parser.add_argument("--eval-split", type=str, choices=["val", "train", "dummy"], default=None, help="Dataset split used for periodic rFID. Defaults to periodic_eval.split in config when omitted.")
     parser.add_argument("--eval-batch-size", type=int, default=None, help="Optional batch size for periodic rFID evaluation.")
     args = parser.parse_args()
     
     # Validate that either data-path or use-hf is provided
     if args.data_path is None and not args.use_hf:
         parser.error("--data-path is required unless using --use-hf")
-    if args.eval_every_steps < 0:
+    if args.eval_every_steps is not None and args.eval_every_steps < 0:
         parser.error("--eval-every-steps must be >= 0")
-    if args.eval_num_samples <= 0:
-        parser.error("--eval-num-samples must be > 0")
     if args.eval_batch_size is not None and args.eval_batch_size <= 0:
         parser.error("--eval-batch-size must be > 0 when provided")
     
@@ -233,7 +231,11 @@ def run_periodic_rfid_eval(
             if split_name == "dummy":
                 if dummy_images is None or dummy_images.numel() == 0:
                     raise RuntimeError("Dummy periodic eval requires current batch images.")
-                eval_images = dummy_images[:num_samples].to(device, non_blocking=True)
+                if num_samples <= 0:
+                    eval_images = dummy_images
+                else:
+                    eval_images = dummy_images[:num_samples]
+                eval_images = eval_images.to(device, non_blocking=True)
                 with autocast(**autocast_kwargs):
                     recon = model(eval_images)
                 ref_arr = _to_uint8_nhwc(eval_images)
@@ -241,7 +243,7 @@ def run_periodic_rfid_eval(
             else:
                 if eval_dataset is None:
                     raise RuntimeError(f"Periodic eval dataset is not available for split '{split_name}'.")
-                n = min(num_samples, len(eval_dataset))
+                n = len(eval_dataset) if num_samples <= 0 else min(num_samples, len(eval_dataset))
                 if n <= 0:
                     raise RuntimeError("Periodic eval dataset is empty.")
                 subset = Subset(eval_dataset, range(n))
@@ -323,26 +325,84 @@ def main():
     ema_decay = float(training_cfg.get("ema_decay", 0.9999))
     num_epochs = int(training_cfg.get("epochs", 200))
     default_seed = int(training_cfg.get("global_seed", 0))
+    periodic_eval_section = full_cfg.get("periodic_eval", None)
+    periodic_eval_cfg = OmegaConf.to_container(periodic_eval_section, resolve=True) if periodic_eval_section is not None else {}
+    periodic_eval_cfg = dict(periodic_eval_cfg) if isinstance(periodic_eval_cfg, dict) else {}
+    periodic_eval_every_steps = int(
+        args.eval_every_steps
+        if args.eval_every_steps is not None
+        else periodic_eval_cfg.get("every_steps", 0)
+    )
+    periodic_eval_num_samples = int(
+        args.eval_num_samples
+        if args.eval_num_samples is not None
+        else periodic_eval_cfg.get("num_samples", 32)
+    )
+    periodic_eval_split = (
+        args.eval_split
+        if args.eval_split is not None
+        else periodic_eval_cfg.get("split", "val")
+    )
+    periodic_eval_batch_size = int(
+        args.eval_batch_size
+        if args.eval_batch_size is not None
+        else periodic_eval_cfg.get("batch_size", batch_size)
+    )
+    if periodic_eval_every_steps < 0:
+        raise ValueError("Periodic evaluation every_steps must be >= 0.")
+    if periodic_eval_split not in {"val", "train", "dummy"}:
+        raise ValueError(
+            f"Invalid periodic evaluation split '{periodic_eval_split}'. "
+            "Expected one of: val, train, dummy."
+        )
+    if periodic_eval_batch_size <= 0:
+        raise ValueError("Periodic evaluation batch_size must be > 0.")
+
+    do_eval = False
+    eval_setup_error: Optional[str] = None
+    eval_setup_note: Optional[str] = None
+    eval_interval = 0
+    eval_model = False
+    eval_metrics = ("rfid", "psnr", "ssim")
+    eval_data = None
+    reference_npz_path = None
     eval_section = full_cfg.get("eval", None)
     if eval_section:
-        do_eval = True
         eval_interval = int(eval_section.get("eval_interval", 5000))
         eval_model = eval_section.get("eval_model", False)  # additionally eval non-EMA model
-        eval_metrics = eval_section.get("metrics", ("rfid", "psnr", "ssim"))
+        eval_metrics = tuple(eval_section.get("metrics", ("rfid", "psnr", "ssim")))
         eval_data = eval_section.get("data_path", None)
         reference_npz_path = eval_section.get("reference_npz_path", None)
         use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
-        if not use_hf_eval:
-            assert eval_data, "eval.data_path must be specified to enable evaluation (unless using --use-hf-eval)."
-        assert reference_npz_path, "eval.reference_npz_path must be specified to enable evaluation."
-        assert len(eval_metrics) > 0, "eval.metrics must contain at least one metric to compute."
-    else:
-        do_eval = False
+        missing_fields = []
+        if eval_interval > 0:
+            if not use_hf_eval and not eval_data:
+                missing_fields.append("eval.data_path (or --use-hf-eval/--hf-eval-load-from-disk)")
+            if len(eval_metrics) == 0:
+                missing_fields.append("eval.metrics")
+            if reference_npz_path and not os.path.exists(reference_npz_path):
+                eval_setup_note = (
+                    f"eval.reference_npz_path not found at {reference_npz_path}; "
+                    "falling back to online reference images from the eval dataset."
+                )
+                reference_npz_path = None
+            elif reference_npz_path is None:
+                eval_setup_note = "Using online reference images from the eval dataset (no eval.reference_npz_path provided)."
+            do_eval = len(missing_fields) == 0
+            if not do_eval:
+                eval_setup_error = (
+                    "Disabling full reconstruction evaluation because: "
+                    + "; ".join(missing_fields)
+                )
     global_seed = args.global_seed if args.global_seed is not None else default_seed
     seed = global_seed * world_size + rank
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     experiment_dir, checkpoint_dir, logger = configure_experiment_dirs(args, rank)
+    if eval_setup_error and rank == 0:
+        logger.warning(eval_setup_error)
+    if eval_setup_note and rank == 0 and do_eval:
+        logger.info(eval_setup_note)
     # update args as a dict to full_cfg
     full_cfg.cmd_args = vars(args)
     full_cfg.experiment_dir = experiment_dir
@@ -487,18 +547,17 @@ def main():
             total_samples = len(eval_dataset)
             logger.info(f"Evaluation dataset loaded, containing {total_samples} images.")
 
-    periodic_eval_enabled = args.eval_every_steps > 0
+    periodic_eval_enabled = periodic_eval_every_steps > 0
     periodic_eval_dataset = None
-    periodic_eval_batch_size = args.eval_batch_size if args.eval_batch_size is not None else batch_size
     if periodic_eval_enabled:
         try:
             periodic_eval_transform = transforms.Compose([
                 transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
                 transforms.ToTensor(),
             ])
-            if args.eval_split == "dummy":
+            if periodic_eval_split == "dummy":
                 periodic_eval_dataset = None
-            elif args.eval_split == "train":
+            elif periodic_eval_split == "train":
                 periodic_eval_dataset = train_dataset
             else:
                 if eval_dataset is not None:
@@ -528,15 +587,18 @@ def main():
                     periodic_eval_dataset = ImageFolder(str(val_path), transform=periodic_eval_transform)
 
             if rank == 0:
-                if args.eval_split == "dummy":
+                if periodic_eval_split == "dummy":
+                    sample_desc = "full current batch" if periodic_eval_num_samples <= 0 else str(periodic_eval_num_samples)
                     logger.info(
-                        f"Periodic rFID enabled every {args.eval_every_steps} steps on split=dummy "
-                        f"(num_samples={args.eval_num_samples}, batch_size={periodic_eval_batch_size})."
+                        f"Periodic rFID enabled every {periodic_eval_every_steps} steps on split=dummy "
+                        f"(num_samples={sample_desc}, batch_size={periodic_eval_batch_size})."
                     )
                 else:
+                    chosen_samples = len(periodic_eval_dataset) if periodic_eval_num_samples <= 0 else min(periodic_eval_num_samples, len(periodic_eval_dataset))
+                    sample_desc = f"{chosen_samples} (full dataset)" if periodic_eval_num_samples <= 0 else str(chosen_samples)
                     logger.info(
-                        f"Periodic rFID enabled every {args.eval_every_steps} steps on split={args.eval_split} "
-                        f"with {min(args.eval_num_samples, len(periodic_eval_dataset))} samples "
+                        f"Periodic rFID enabled every {periodic_eval_every_steps} steps on split={periodic_eval_split} "
+                        f"with {sample_desc} samples "
                         f"(batch_size={periodic_eval_batch_size})."
                     )
         except Exception as exc:
@@ -806,19 +868,19 @@ def main():
                     if args.wandb:
                         wandb_utils.log(eval_stats, step=global_step)
                 logger.info("Evaluation done.")
-            if periodic_eval_enabled and global_step > 0 and (global_step % args.eval_every_steps == 0):
+            if periodic_eval_enabled and global_step > 0 and (global_step % periodic_eval_every_steps == 0):
                 eval_model_ref = ema_model
                 eval_rfid, eval_error = run_periodic_rfid_eval(
                     model=eval_model_ref,
-                    split_name=args.eval_split,
+                    split_name=periodic_eval_split,
                     rank=rank,
                     world_size=world_size,
                     device=device,
                     autocast_kwargs=autocast_kwargs,
-                    num_samples=args.eval_num_samples,
+                    num_samples=periodic_eval_num_samples,
                     eval_batch_size=periodic_eval_batch_size,
                     eval_dataset=periodic_eval_dataset,
-                    dummy_images=images if args.eval_split == "dummy" else None,
+                    dummy_images=images if periodic_eval_split == "dummy" else None,
                 )
                 if rank == 0:
                     if eval_error is not None:

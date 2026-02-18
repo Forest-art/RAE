@@ -245,6 +245,7 @@ def evaluate_reconstruction_distributed(
         Dictionary of metrics (only on rank 0, None on other ranks)
     """
     # model.eval()
+    use_online_reference = reference_npz_path is None
     # Save shard NPZ
     temp_dir = os.path.join(experiment_dir, "eval_npzs")
     if rank == 0:
@@ -280,10 +281,15 @@ def evaluate_reconstruction_distributed(
 
     # Reconstruct images on this rank
     reconstructions = []
+    references = [] if use_online_reference else None
     iterator = tqdm(loader, desc=f"[Rank {rank}] Reconstructing", file=sys.stdout) if rank == 0 else loader
 
     with torch.inference_mode():
         for images, _ in iterator:
+            if use_online_reference:
+                ref_np = images.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+                for img in ref_np:
+                    references.append(img)
             images = images.to(device, non_blocking=True)
             with autocast(**autocast_kwargs):
                 recon = model(images)
@@ -295,12 +301,26 @@ def evaluate_reconstruction_distributed(
             for img in recon_np:
                 reconstructions.append(img)
 
-    reconstructions = np.stack(reconstructions)
+    if reconstructions:
+        reconstructions = np.stack(reconstructions)
+    else:
+        reconstructions = np.empty((0,), dtype=np.uint8)
     shard_path = os.path.join(temp_dir, f"recon_{global_step:07d}_{rank:02d}.npz")
     np.savez(shard_path, arr_0=reconstructions)
 
+    reference_shard_path = None
+    if use_online_reference:
+        if references:
+            references = np.stack(references)
+        else:
+            references = np.empty((0,), dtype=np.uint8)
+        reference_shard_path = os.path.join(temp_dir, f"ref_{global_step:07d}_{rank:02d}.npz")
+        np.savez(reference_shard_path, arr_0=references)
+
     if rank == 0:
         print(f"[Rank {rank}] Saved {len(reconstructions)} reconstructions to {shard_path}")
+        if use_online_reference:
+            print(f"[Rank {rank}] Saved {len(references)} online references to {reference_shard_path}")
 
     # Wait for all ranks to finish reconstruction
     if world_size > 1:
@@ -314,19 +334,33 @@ def evaluate_reconstruction_distributed(
         for r in range(world_size):
             shard_file = os.path.join(temp_dir, f"recon_{global_step:07d}_{r:02d}.npz")
             shard_data = np.load(shard_file)["arr_0"]
+            if shard_data.size == 0:
+                continue
             all_recons.append(shard_data)
+
+        if len(all_recons) == 0:
+            raise RuntimeError("No reconstruction samples were generated for evaluation.")
 
         combined_recons = np.concatenate(all_recons, axis=0)[:num_samples]
         print(f"[Eval] Combined reconstruction NPZ shape: {combined_recons.shape}")
 
-        # Load reference NPZ
-        ref_npz_path = reference_npz_path
-
-        if not os.path.exists(ref_npz_path):
-            raise FileNotFoundError(f"Reference NPZ not found at {ref_npz_path}")
-
-        ref_images = np.load(ref_npz_path)["arr_0"]
-        print(f"[Eval] Loaded reference NPZ from {ref_npz_path}, shape: {ref_images.shape}")
+        if use_online_reference:
+            all_refs = []
+            for r in range(world_size):
+                ref_shard_file = os.path.join(temp_dir, f"ref_{global_step:07d}_{r:02d}.npz")
+                ref_shard = np.load(ref_shard_file)["arr_0"]
+                if ref_shard.size == 0:
+                    continue
+                all_refs.append(ref_shard)
+            if len(all_refs) == 0:
+                raise RuntimeError("No online reference samples were collected for evaluation.")
+            ref_images = np.concatenate(all_refs, axis=0)[:num_samples]
+            print(f"[Eval] Built online reference batch with shape: {ref_images.shape}")
+        else:
+            if not os.path.exists(reference_npz_path):
+                raise FileNotFoundError(f"Reference NPZ not found at {reference_npz_path}")
+            ref_images = np.load(reference_npz_path)["arr_0"]
+            print(f"[Eval] Loaded reference NPZ from {reference_npz_path}, shape: {ref_images.shape}")
 
         # Compute metrics
         print("[Eval] Computing metrics...")
@@ -349,6 +383,10 @@ def evaluate_reconstruction_distributed(
             shard_file = os.path.join(temp_dir, f"recon_{global_step:07d}_{r:02d}.npz")
             if os.path.exists(shard_file):
                 os.remove(shard_file)
+            if use_online_reference:
+                ref_shard_file = os.path.join(temp_dir, f"ref_{global_step:07d}_{r:02d}.npz")
+                if os.path.exists(ref_shard_file):
+                    os.remove(ref_shard_file)
 
     if world_size > 1:
         dist.barrier()
