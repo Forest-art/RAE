@@ -39,12 +39,12 @@ periodic_eval:
   split: val
   num_samples: -1  # <=0 means full split
 
-# eval:
-#   eval_interval: 2500
-#   eval_model: true
-#   data_path: 'data/imagenet/val/'
-#   reference_npz_path: 'data/imagenet/val_256.npz'
-#   metrics: ['psnr', 'ssim', 'rfid']
+eval:
+  eval_interval: 2500
+  eval_model: true
+  metrics: ['psnr', 'ssim', 'rfid']
+  # For local ImageFolder eval, set data_path; for HF eval, pass --use-hf-eval.
+  # data_path: 'data/imagenet/val/'
 
 gan:
   disc:
