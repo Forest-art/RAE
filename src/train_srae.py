@@ -341,12 +341,12 @@ def main():
     # Model
     logger.info("Initializing S-RAE model...")
     model: SRAE = instantiate_from_config(srae_config).to(device)
-    model_image_size = int(getattr(model, "img_size", args.image_size))
-    effective_image_size = model_image_size
-    if args.image_size != effective_image_size and rank == 0:
+    effective_image_size = int(args.image_size)
+    model_image_size = int(getattr(model, "img_size", effective_image_size))
+    if model_image_size != effective_image_size and rank == 0:
         logger.warning(
-            f"Requested --image-size={args.image_size} but S-RAE model uses img_size={effective_image_size}. "
-            f"Using {effective_image_size} to avoid shape mismatch."
+            f"Requested --image-size={effective_image_size} but S-RAE model reconstructs img_size={model_image_size}. "
+            "Training/eval loaders will follow --image-size."
         )
     
     # Only train student (teacher is frozen by default in SRAE)

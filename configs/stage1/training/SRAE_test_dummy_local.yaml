@@ -2,7 +2,8 @@ stage_1:
   target: stage1.SRAE
   params:
     dinov2_model_name: "facebook/dinov2-with-registers-base"
-    img_size: 224
+    img_size: 256
+    encoder_input_size: 224
     patch_size: 14
     mask_ratio: 0.75
     bottleneck_dim: 768

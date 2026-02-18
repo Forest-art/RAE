@@ -10,26 +10,14 @@ A unified model for semantic understanding and image generation.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Dict
-from transformers import Dinov2Model, AutoConfig
+from typing import Dict, Optional, Tuple
+from transformers import AutoImageProcessor, Dinov2Model
+try:
+    from transformers import Dinov2WithRegistersModel
+except Exception:  # pragma: no cover - older transformers versions
+    Dinov2WithRegistersModel = None
 from .decoders import GeneralDecoder
 from .decoders.utils import ViTMAEConfig
-import random
-
-
-class PatchEmbed(nn.Module):
-    """Image to Patch Embedding (from timm)"""
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        
-    def forward(self, x):
-        B, C, H, W = x.shape
-        x = self.proj(x).flatten(2).transpose(1, 2)  # (B, N, D)
-        return x
 
 
 class SRAE(nn.Module):
@@ -43,9 +31,10 @@ class SRAE(nn.Module):
     def __init__(
         self,
         # Teacher/Student backbone config
-        dinov2_model_name: str = "facebook/dinov2-base",
-        img_size: int = 224,
-        patch_size: int = 14,
+        dinov2_model_name: str = "facebook/dinov2-with-registers-base",
+        img_size: int = 256,
+        encoder_input_size: int = 224,
+        patch_size: Optional[int] = 14,  # encoder patch size; inferred from backbone if None
         
         # Masking config
         mask_ratio: float = 0.75,
@@ -72,9 +61,8 @@ class SRAE(nn.Module):
     ):
         super().__init__()
         
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2
+        self.img_size = int(img_size)
+        self.encoder_input_size = int(encoder_input_size)
         self.mask_ratio = mask_ratio
         self.loss_rec_weight = loss_rec_weight
         self.loss_align_weight = loss_align_weight
@@ -83,7 +71,7 @@ class SRAE(nn.Module):
         
         # ========== Teacher (Frozen DINOv2) ==========
         print(f"Loading Teacher DINOv2 from {dinov2_model_name}...")
-        self.teacher = Dinov2Model.from_pretrained(dinov2_model_name)
+        self.teacher = self._load_backbone(dinov2_model_name)
         self.teacher.eval()
         for param in self.teacher.parameters():
             param.requires_grad = False
@@ -93,13 +81,40 @@ class SRAE(nn.Module):
         
         # ========== Student (Trainable DINOv2) ==========
         print(f"Loading Student DINOv2 from {dinov2_model_name}...")
-        self.student_encoder = Dinov2Model.from_pretrained(dinov2_model_name)
+        self.student_encoder = self._load_backbone(dinov2_model_name)
         student_dim = self.student_encoder.config.hidden_size
         print(f"Student loaded. Hidden dim: {student_dim}")
-        
-        # Remove student's head (we'll use our own)
-        if hasattr(self.student_encoder, 'head'):
-            self.student_encoder.head = nn.Identity()
+
+        self.teacher_prefix_tokens = 1 + int(getattr(self.teacher.config, "num_register_tokens", 0))
+        self.student_prefix_tokens = 1 + int(getattr(self.student_encoder.config, "num_register_tokens", 0))
+
+        # RAE-aligned encoder preprocessing (resize + mean/std normalization).
+        processor = self._load_image_processor(dinov2_model_name)
+        encoder_mean = torch.tensor(processor.image_mean, dtype=torch.float32).view(1, 3, 1, 1)
+        encoder_std = torch.tensor(processor.image_std, dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("encoder_mean", encoder_mean, persistent=False)
+        self.register_buffer("encoder_std", encoder_std, persistent=False)
+
+        inferred_encoder_patch = int(getattr(self.student_encoder.config, "patch_size", 14))
+        if patch_size is not None and int(patch_size) != inferred_encoder_patch:
+            raise ValueError(
+                f"Configured encoder patch_size={patch_size} does not match student backbone patch_size={inferred_encoder_patch}."
+            )
+        self.encoder_patch_size = inferred_encoder_patch
+
+        if self.encoder_input_size % self.encoder_patch_size != 0:
+            raise ValueError(
+                f"encoder_input_size ({self.encoder_input_size}) must be divisible by encoder patch_size ({self.encoder_patch_size})."
+            )
+        self.encoder_grid_size = self.encoder_input_size // self.encoder_patch_size
+        self.num_patches = self.encoder_grid_size * self.encoder_grid_size
+
+        if self.img_size % self.encoder_grid_size != 0:
+            raise ValueError(
+                f"img_size ({self.img_size}) must be divisible by encoder token grid size ({self.encoder_grid_size})."
+            )
+        # Keep the same token grid as encoder; decoder patch size adapts to reconstruction resolution.
+        self.decoder_patch_size = self.img_size // self.encoder_grid_size
         
         # ========== Bottleneck ==========
         bottleneck_dim = bottleneck_dim or student_dim
@@ -125,8 +140,8 @@ class SRAE(nn.Module):
             num_hidden_layers=decoder_num_layers,
             num_attention_heads=decoder_num_heads,
             intermediate_size=decoder_dim * 4,
-            image_size=img_size,
-            patch_size=patch_size,
+            image_size=self.img_size,
+            patch_size=self.decoder_patch_size,
             num_channels=3,
             decoder_hidden_size=decoder_dim,
             decoder_num_hidden_layers=decoder_num_layers,
@@ -142,17 +157,81 @@ class SRAE(nn.Module):
         # Mask token (learnable)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
-        
-        # Positional embedding for decoder (full set of patches)
-        self.decoder_pos_embed = nn.Parameter(
-            torch.zeros(1, self.num_patches + 1, decoder_dim)  # +1 for CLS
-        )
-        nn.init.trunc_normal_(self.decoder_pos_embed, std=0.02)
-        
+
         print(f"S-RAE initialized:")
+        print(f"  - Encoder input size: {self.encoder_input_size}")
+        print(f"  - Reconstruction size: {self.img_size}")
+        print(f"  - Encoder patch size: {self.encoder_patch_size}")
+        print(f"  - Decoder patch size: {self.decoder_patch_size}")
+        print(f"  - Num patches: {self.num_patches}")
         print(f"  - Bottleneck dim: {bottleneck_dim}")
         print(f"  - Decoder dim: {decoder_dim}")
         print(f"  - Mask ratio: {mask_ratio}")
+
+    @staticmethod
+    def _load_image_processor(model_name: str):
+        load_errors = []
+        for local_only in (True, False):
+            try:
+                return AutoImageProcessor.from_pretrained(
+                    model_name,
+                    local_files_only=local_only,
+                )
+            except Exception as exc:
+                mode = "local-only" if local_only else "remote-enabled"
+                load_errors.append(f"{mode}: {exc}")
+        raise RuntimeError(
+            f"Failed to load AutoImageProcessor for '{model_name}'. Errors: {' | '.join(load_errors)}"
+        )
+
+    @staticmethod
+    def _load_backbone(model_name: str):
+        candidate_classes = []
+        if Dinov2WithRegistersModel is not None:
+            candidate_classes.append(Dinov2WithRegistersModel)
+        candidate_classes.append(Dinov2Model)
+
+        load_errors = []
+        for model_cls in candidate_classes:
+            for local_only in (True, False):
+                try:
+                    return model_cls.from_pretrained(
+                        model_name,
+                        local_files_only=local_only,
+                    )
+                except Exception as exc:
+                    mode = "local-only" if local_only else "remote-enabled"
+                    load_errors.append(f"{model_cls.__name__}({mode}): {exc}")
+
+        raise RuntimeError(
+            f"Failed to load DINOv2 backbone '{model_name}'. Errors: {' | '.join(load_errors)}"
+        )
+
+    def _preprocess_for_encoder(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[-2:] != (self.encoder_input_size, self.encoder_input_size):
+            x = F.interpolate(
+                x,
+                size=(self.encoder_input_size, self.encoder_input_size),
+                mode="bicubic",
+                align_corners=False,
+            )
+        mean = self.encoder_mean.to(device=x.device, dtype=x.dtype)
+        std = self.encoder_std.to(device=x.device, dtype=x.dtype)
+        return (x - mean) / std
+
+    def _get_student_register_tokens(self, batch_size: int, dtype: torch.dtype, device: torch.device) -> Optional[torch.Tensor]:
+        if self.student_prefix_tokens <= 1:
+            return None
+
+        register_tokens = getattr(self.student_encoder.embeddings, "register_tokens", None)
+        if register_tokens is None:
+            register_tokens = getattr(self.student_encoder.embeddings, "register_token", None)
+        if register_tokens is None:
+            return None
+
+        if register_tokens.dim() == 2:
+            register_tokens = register_tokens.unsqueeze(0)
+        return register_tokens.expand(batch_size, -1, -1).to(device=device, dtype=dtype)
         
     def random_masking(self, x: torch.Tensor, mask_ratio: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -187,18 +266,16 @@ class SRAE(nn.Module):
     @torch.no_grad()
     def forward_teacher(self, x: torch.Tensor) -> torch.Tensor:
         """Forward through frozen teacher"""
-        # Resize to teacher's expected size if needed
-        if x.shape[-2:] != (self.img_size, self.img_size):
-            x = F.interpolate(x, size=(self.img_size, self.img_size), mode='bicubic', align_corners=False)
+        x = self._preprocess_for_encoder(x)
         
         outputs = self.teacher(pixel_values=x, output_hidden_states=True)
         
         if self.teacher_output_type == "cls":
             # Use CLS token
             return outputs.last_hidden_state[:, 0]  # [B, D]
-        else:
-            # Use mean of patch tokens
-            return outputs.last_hidden_state[:, 1:].mean(dim=1)  # [B, D]
+
+        # Use mean of patch tokens
+        return outputs.last_hidden_state[:, self.teacher_prefix_tokens:].mean(dim=1)  # [B, D]
     
     def forward_student(self, x: torch.Tensor, mask_ratio: Optional[float] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -212,9 +289,7 @@ class SRAE(nn.Module):
         if mask_ratio is None:
             mask_ratio = self.mask_ratio
         
-        # Resize if needed
-        if x.shape[-2:] != (self.img_size, self.img_size):
-            x = F.interpolate(x, size=(self.img_size, self.img_size), mode='bicubic', align_corners=False)
+        x = self._preprocess_for_encoder(x)
         
         # Get patch embeddings from student's embedding layer
         # DINOv2 uses a patch embedding in the model
@@ -229,13 +304,13 @@ class SRAE(nn.Module):
         B, N_visible, D = x_visible.shape
         
         # Get position embeddings for visible patches
-        num_patches = self.student_encoder.embeddings.patch_embeddings.num_patches
+        num_patches = patch_embeds.shape[1]
         pos_embed = self.student_encoder.embeddings.position_embeddings  # [1, N+1, D]
         
         # Interpolate position embeddings if needed
         if pos_embed.shape[1] - 1 != num_patches:
             pos_embed = self.student_encoder.embeddings.interpolate_pos_encoding(
-                pos_embed, self.img_size, self.img_size
+                pos_embed, self.encoder_input_size, self.encoder_input_size
             )
         
         # Extract position embeddings for visible patches
@@ -251,13 +326,19 @@ class SRAE(nn.Module):
         # Add CLS token
         cls_token = self.student_encoder.embeddings.cls_token.expand(B, -1, -1)
         cls_token = cls_token + pos_embed[:, :1]
-        x_full = torch.cat([cls_token, x_visible], dim=1)  # [B, 1+N_visible, D]
+        register_tokens = self._get_student_register_tokens(B, cls_token.dtype, cls_token.device)
+        if register_tokens is not None:
+            x_full = torch.cat([cls_token, register_tokens, x_visible], dim=1)
+            prefix_tokens = 1 + register_tokens.shape[1]
+        else:
+            x_full = torch.cat([cls_token, x_visible], dim=1)  # [B, 1+N_visible, D]
+            prefix_tokens = 1
         
         # Pass through transformer
         hidden_states = self.student_encoder.encoder(x_full).last_hidden_state
         
-        # Extract patch tokens (exclude CLS)
-        patch_tokens = hidden_states[:, 1:]  # [B, N_visible, D]
+        # Extract patch tokens (exclude cls/register tokens)
+        patch_tokens = hidden_states[:, prefix_tokens:]  # [B, N_visible, D]
         
         # Bottleneck
         z = self.bottleneck_proj(patch_tokens)  # [B, N_visible, bottleneck_dim]
@@ -308,11 +389,11 @@ class SRAE(nn.Module):
         """
         Convert patch logits to image.
         Args:
-            x: [B, N, patch_dim] where patch_dim = patch_size^2 * 3
+            x: [B, N, patch_dim] where patch_dim = decoder_patch_size^2 * 3
         Returns:
             img: [B, 3, H, W]
         """
-        return self.decoder.unpatchify(x)
+        return self.decoder.unpatchify(x, original_image_size=(self.img_size, self.img_size))
 
     def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
         """
@@ -320,17 +401,21 @@ class SRAE(nn.Module):
         Args:
             imgs: [B, C, H, W]
         Returns:
-            patches: [B, N, patch_size^2 * C]
+            patches: [B, N, decoder_patch_size^2 * C]
         """
-        p = self.patch_size
+        p = self.decoder_patch_size
         B, C, H, W = imgs.shape
         if H % p != 0 or W % p != 0:
             raise ValueError(
-                f"Input resolution ({H}, {W}) must be divisible by patch_size {p}."
+                f"Input resolution ({H}, {W}) must be divisible by decoder patch_size {p}."
             )
 
         h = H // p
         w = W // p
+        if h * w != self.num_patches:
+            raise ValueError(
+                f"Patchified token count {h * w} does not match model num_patches {self.num_patches}."
+            )
         patches = imgs.reshape(B, C, h, p, w, p)
         patches = patches.permute(0, 2, 4, 3, 5, 1).reshape(B, h * w, p * p * C)
         return patches
@@ -360,9 +445,14 @@ class SRAE(nn.Module):
         target = (target - mean) / (var + 1e-6) ** 0.5
         
         # Compute loss only on masked patches
-        loss_rec = (pred - target) ** 2
-        loss_rec = loss_rec.mean(dim=-1)  # [B, N]
-        loss_rec = (loss_rec * mask).sum() / mask.sum()  # Mean over masked patches
+        rec_per_patch = (pred - target) ** 2
+        rec_per_patch = rec_per_patch.mean(dim=-1)  # [B, N]
+        mask_sum = mask.sum()
+        if mask_sum.item() > 0:
+            loss_rec = (rec_per_patch * mask).sum() / mask_sum  # mean over masked patches
+        else:
+            # mask_ratio=0 during online eval: fallback to full-patch reconstruction MSE.
+            loss_rec = rec_per_patch.mean()
         
         # 2. Alignment loss (cosine similarity)
         # z_proj: [B, N_visible, teacher_dim]
