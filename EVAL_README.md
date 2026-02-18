@@ -2,6 +2,52 @@
 
 Evaluation tools for measuring encoder representation quality.
 
+## Periodic rFID During Stage-1 Training
+
+`src/train_stage1.py` supports lightweight periodic rFID evaluation during training:
+
+- `--eval-every-steps`: run every N optimizer steps (`0` disables)
+- `--eval-num-samples`: number of samples used for each rFID run
+- `--eval-split`: `val`, `train`, or `dummy`
+- `--eval-batch-size`: optional eval batch size (defaults to train batch size)
+
+Example (validation split):
+
+```bash
+python src/train_stage1.py \
+  --config configs/stage1/training/DINOv2-B_decB.yaml \
+  --data-path /path/to/imagenet/train \
+  --eval-every-steps 1000 \
+  --eval-num-samples 128 \
+  --eval-split val \
+  --eval-batch-size 64
+```
+
+Notes:
+- `--eval-split train` evaluates on the training dataset.
+- `--eval-split val` uses configured eval data when available; otherwise it tries sibling folders `val`/`validation`.
+- `--eval-split dummy` runs a smoke-style rFID from the current training batch (no separate eval split needed).
+- Periodic eval failures are caught and logged; training continues.
+
+Dummy smoke test flow:
+
+```bash
+bash scripts/smoke_dummy.sh
+```
+
+Then run stage-1 with dummy periodic eval enabled:
+
+```bash
+python src/train_stage1.py \
+  --config configs/stage1/training/test_dummy.yaml \
+  --use-hf \
+  --hf-load-from-disk dummy_data/dummy_imagenet \
+  --hf-split train \
+  --eval-every-steps 5 \
+  --eval-num-samples 4 \
+  --eval-split dummy
+```
+
 ## Supported Metrics
 
 ### 1. Linear Probing
