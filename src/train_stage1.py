@@ -222,6 +222,9 @@ def run_periodic_rfid_eval(
     """
     rfid_value: Optional[float] = None
     error_message: Optional[str] = None
+    was_training = bool(getattr(model, "training", False))
+    if hasattr(model, "eval"):
+        model.eval()
 
     if world_size > 1:
         dist.barrier()
@@ -272,6 +275,8 @@ def run_periodic_rfid_eval(
     finally:
         if world_size > 1:
             dist.barrier()
+        if was_training and hasattr(model, "train"):
+            model.train()
 
     return rfid_value, error_message
 

@@ -209,7 +209,8 @@ class SRAE(nn.Module):
             mask: [B, N]
             ids_restore: [B, N]
         """
-        mask_ratio = mask_ratio or self.mask_ratio
+        if mask_ratio is None:
+            mask_ratio = self.mask_ratio
         
         # Resize if needed
         if x.shape[-2:] != (self.img_size, self.img_size):

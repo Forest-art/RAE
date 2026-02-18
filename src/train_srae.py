@@ -120,6 +120,14 @@ def _to_uint8_nhwc(images: torch.Tensor) -> np.ndarray:
     return images.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
 
+def _forward_reconstruction_for_eval(model: torch.nn.Module, images: torch.Tensor) -> torch.Tensor:
+    # S-RAE reconstruction metrics should use unmasked forward when available.
+    try:
+        return model(images, mask_ratio=0.0)
+    except TypeError:
+        return model(images)
+
+
 @torch.no_grad()
 def run_periodic_rfid_eval(
     model: torch.nn.Module,
@@ -135,6 +143,9 @@ def run_periodic_rfid_eval(
 ) -> Tuple[Optional[float], Optional[str]]:
     rfid_value: Optional[float] = None
     error_message: Optional[str] = None
+    was_training = bool(getattr(model, "training", False))
+    if hasattr(model, "eval"):
+        model.eval()
 
     if world_size > 1:
         dist.barrier()
@@ -150,7 +161,7 @@ def run_periodic_rfid_eval(
                     eval_images = dummy_images[:num_samples]
                 eval_images = eval_images.to(device, non_blocking=True)
                 with autocast(**autocast_kwargs):
-                    recon = model(eval_images)
+                    recon = _forward_reconstruction_for_eval(model, eval_images)
                 ref_arr = _to_uint8_nhwc(eval_images)
                 rec_arr = _to_uint8_nhwc(recon)
             else:
@@ -172,7 +183,7 @@ def run_periodic_rfid_eval(
                 for images, _ in eval_loader:
                     images = images.to(device, non_blocking=True)
                     with autocast(**autocast_kwargs):
-                        recon = model(images)
+                        recon = _forward_reconstruction_for_eval(model, images)
                     ref_images.append(_to_uint8_nhwc(images))
                     rec_images.append(_to_uint8_nhwc(recon))
                 ref_arr = np.concatenate(ref_images, axis=0)
@@ -185,6 +196,8 @@ def run_periodic_rfid_eval(
     finally:
         if world_size > 1:
             dist.barrier()
+        if was_training and hasattr(model, "train"):
+            model.train()
 
     return rfid_value, error_message
 
@@ -690,7 +703,7 @@ def main():
                 logger.info("Generating EMA samples...")
                 with torch.no_grad():
                     sample_images = images[:4]
-                    samples = ema_model(sample_images)
+                    samples = _forward_reconstruction_for_eval(ema_model, sample_images)
                     comparison = torch.cat([sample_images, samples], dim=0).cpu()
                     grid = make_grid(comparison, nrow=4)
                     if args.wandb:
@@ -715,6 +728,7 @@ def main():
                         global_step=global_step,
                         autocast_kwargs=autocast_kwargs,
                         reference_npz_path=reference_npz_path,
+                        forward_kwargs={"mask_ratio": 0.0},
                     )
                     eval_stats = {f"eval_{mod_name}/{k}": v for k, v in eval_stats.items()} if eval_stats is not None else {}
                     if args.wandb:
