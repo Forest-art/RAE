@@ -211,13 +211,22 @@ def main():
     # Config
     full_cfg = OmegaConf.load(args.config)
     srae_config = full_cfg.get("stage_1")
-    training_cfg = OmegaConf.to_container(full_cfg.get("training", {}), resolve=True)
+    training_section = full_cfg.get("training", None)
+    training_cfg = OmegaConf.to_container(training_section, resolve=True) if training_section is not None else {}
     training_cfg = dict(training_cfg) if isinstance(training_cfg, dict) else {}
     
     # GAN config
-    gan_cfg = full_cfg.get("gan", {})
+    gan_section = full_cfg.get("gan", None)
+    gan_cfg = OmegaConf.to_container(gan_section, resolve=True) if gan_section is not None else {}
+    gan_cfg = dict(gan_cfg) if isinstance(gan_cfg, dict) else {}
+    if not gan_cfg:
+        raise ValueError("Config must define a top-level 'gan' section for S-RAE training.")
     disc_cfg = gan_cfg.get("disc", {})
+    disc_cfg = dict(disc_cfg) if isinstance(disc_cfg, dict) else {}
+    if not disc_cfg:
+        raise ValueError("gan.disc configuration is required for S-RAE training.")
     loss_cfg = gan_cfg.get("loss", {})
+    loss_cfg = dict(loss_cfg) if isinstance(loss_cfg, dict) else {}
     
     perceptual_weight = float(loss_cfg.get("perceptual_weight", 1.0))
     disc_weight = float(loss_cfg.get("disc_weight", 0.0))

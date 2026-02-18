@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any, Dict, Iterable, Optional
 
 import torch
@@ -9,7 +10,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 
 def _as_tuple(values: Any, length: int = 2) -> tuple:
-    if isinstance(values, (list, tuple)):
+    if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
         if len(values) != length:
             raise ValueError(f"Expected sequence of length {length}, got {len(values)}.")
         return tuple(float(v) for v in values)
