@@ -16,14 +16,14 @@ import os
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid
@@ -42,8 +42,8 @@ from disc import (
     vanilla_d_loss,
     vanilla_g_loss,
 )
-from eval.fid import _compute_inception_moments_from_arr, _fid_from_moments
-from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
+from eval import evaluate_reconstruction_distributed
+from eval.fid import calculate_rfid
 from utils import wandb_utils
 from utils.model_utils import instantiate_from_config
 from utils.train_utils import *
@@ -72,10 +72,18 @@ def parse_args():
     parser.add_argument("--use-hf-eval", action="store_true")
     parser.add_argument("--hf-eval-split", type=str, default="validation")
     parser.add_argument("--hf-eval-load-from-disk", type=str, default=None)
+    parser.add_argument("--eval-every-steps", type=int, default=None, help="Run periodic rFID every N steps (0 disables). Defaults to periodic_eval.every_steps in config when omitted.")
+    parser.add_argument("--eval-num-samples", type=int, default=None, help="Samples for periodic rFID. Use <=0 for full split. Defaults to periodic_eval.num_samples in config when omitted.")
+    parser.add_argument("--eval-split", type=str, choices=["val", "train", "dummy"], default=None, help="Split for periodic rFID. Defaults to periodic_eval.split in config when omitted.")
+    parser.add_argument("--eval-batch-size", type=int, default=None, help="Batch size for periodic rFID. Defaults to periodic_eval.batch_size or training batch size.")
     args = parser.parse_args()
     
     if args.data_path is None and not args.use_hf:
         parser.error("--data-path is required unless using --use-hf")
+    if args.eval_every_steps is not None and args.eval_every_steps < 0:
+        parser.error("--eval-every-steps must be >= 0")
+    if args.eval_batch_size is not None and args.eval_batch_size <= 0:
+        parser.error("--eval-batch-size must be > 0 when provided")
     
     return args
 
@@ -108,6 +116,79 @@ def select_gan_losses(disc_kind: str, gen_kind: str):
     return disc_loss_fn, gen_loss_fn
 
 
+def _to_uint8_nhwc(images: torch.Tensor) -> np.ndarray:
+    return images.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+
+
+@torch.no_grad()
+def run_periodic_rfid_eval(
+    model: torch.nn.Module,
+    split_name: str,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    autocast_kwargs: dict,
+    num_samples: int,
+    eval_batch_size: int,
+    eval_dataset=None,
+    dummy_images: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[float], Optional[str]]:
+    rfid_value: Optional[float] = None
+    error_message: Optional[str] = None
+
+    if world_size > 1:
+        dist.barrier()
+    try:
+        if rank == 0:
+            bs = max(1, int(eval_batch_size))
+            if split_name == "dummy":
+                if dummy_images is None or dummy_images.numel() == 0:
+                    raise RuntimeError("Dummy periodic eval requires current batch images.")
+                if num_samples <= 0:
+                    eval_images = dummy_images
+                else:
+                    eval_images = dummy_images[:num_samples]
+                eval_images = eval_images.to(device, non_blocking=True)
+                with autocast(**autocast_kwargs):
+                    recon = model(eval_images)
+                ref_arr = _to_uint8_nhwc(eval_images)
+                rec_arr = _to_uint8_nhwc(recon)
+            else:
+                if eval_dataset is None:
+                    raise RuntimeError(f"Periodic eval dataset is not available for split '{split_name}'.")
+                n = len(eval_dataset) if num_samples <= 0 else min(num_samples, len(eval_dataset))
+                if n <= 0:
+                    raise RuntimeError("Periodic eval dataset is empty.")
+                subset = Subset(eval_dataset, range(n))
+                eval_loader = DataLoader(
+                    subset,
+                    batch_size=bs,
+                    shuffle=False,
+                    num_workers=2,
+                    pin_memory=True,
+                    drop_last=False,
+                )
+                ref_images, rec_images = [], []
+                for images, _ in eval_loader:
+                    images = images.to(device, non_blocking=True)
+                    with autocast(**autocast_kwargs):
+                        recon = model(images)
+                    ref_images.append(_to_uint8_nhwc(images))
+                    rec_images.append(_to_uint8_nhwc(recon))
+                ref_arr = np.concatenate(ref_images, axis=0)
+                rec_arr = np.concatenate(rec_images, axis=0)
+
+            device_str = "cuda" if device.type == "cuda" else "cpu"
+            rfid_value = float(calculate_rfid(ref_arr, rec_arr, bs=bs, device=device_str))
+    except Exception as exc:
+        error_message = str(exc)
+    finally:
+        if world_size > 1:
+            dist.barrier()
+
+    return rfid_value, error_message
+
+
 def main():
     args = parse_args()
     
@@ -118,6 +199,7 @@ def main():
     full_cfg = OmegaConf.load(args.config)
     srae_config = full_cfg.get("stage_1")
     training_cfg = OmegaConf.to_container(full_cfg.get("training", {}), resolve=True)
+    training_cfg = dict(training_cfg) if isinstance(training_cfg, dict) else {}
     
     # GAN config
     gan_cfg = full_cfg.get("gan", {})
@@ -154,16 +236,79 @@ def main():
     num_epochs = int(training_cfg.get("epochs", 100))
     default_seed = int(training_cfg.get("global_seed", 0))
     
-    # Eval config
+    # Periodic eval config
+    periodic_eval_section = full_cfg.get("periodic_eval", None)
+    periodic_eval_cfg = OmegaConf.to_container(periodic_eval_section, resolve=True) if periodic_eval_section is not None else {}
+    periodic_eval_cfg = dict(periodic_eval_cfg) if isinstance(periodic_eval_cfg, dict) else {}
+    periodic_eval_every_steps = int(
+        args.eval_every_steps
+        if args.eval_every_steps is not None
+        else periodic_eval_cfg.get("every_steps", 0)
+    )
+    periodic_eval_num_samples = int(
+        args.eval_num_samples
+        if args.eval_num_samples is not None
+        else periodic_eval_cfg.get("num_samples", 32)
+    )
+    periodic_eval_split = (
+        args.eval_split
+        if args.eval_split is not None
+        else periodic_eval_cfg.get("split", "val")
+    )
+    periodic_eval_batch_size = int(
+        args.eval_batch_size
+        if args.eval_batch_size is not None
+        else periodic_eval_cfg.get("batch_size", batch_size)
+    )
+    if periodic_eval_every_steps < 0:
+        raise ValueError("Periodic evaluation every_steps must be >= 0.")
+    if periodic_eval_split not in {"val", "train", "dummy"}:
+        raise ValueError(
+            f"Invalid periodic evaluation split '{periodic_eval_split}'. "
+            "Expected one of: val, train, dummy."
+        )
+    if periodic_eval_batch_size <= 0:
+        raise ValueError("Periodic evaluation batch_size must be > 0.")
+
+    # Full eval config
+    do_eval = False
+    eval_setup_error: Optional[str] = None
+    eval_setup_note: Optional[str] = None
+    eval_interval = 0
+    eval_model = False
+    eval_metrics = ("rfid", "psnr", "ssim")
+    eval_data = None
+    max_eval_samples = None
+    reference_npz_path = None
     eval_section = full_cfg.get("eval", None)
-    do_eval = eval_section is not None
-    if do_eval:
+    if eval_section:
         eval_interval = int(eval_section.get("eval_interval", 5000))
-        max_eval_samples = eval_section.get("max_eval_samples", None)
+        eval_model = bool(eval_section.get("eval_model", False))
+        eval_metrics = tuple(eval_section.get("metrics", ("rfid", "psnr", "ssim")))
         eval_data = eval_section.get("data_path", None)
+        max_eval_samples = eval_section.get("max_eval_samples", None)
+        reference_npz_path = eval_section.get("reference_npz_path", None)
         use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
-        if not use_hf_eval:
-            assert eval_data, "eval.data_path must be specified"
+        missing_fields = []
+        if eval_interval > 0:
+            if not use_hf_eval and not eval_data:
+                missing_fields.append("eval.data_path (or --use-hf-eval/--hf-eval-load-from-disk)")
+            if len(eval_metrics) == 0:
+                missing_fields.append("eval.metrics")
+            if reference_npz_path and not os.path.exists(reference_npz_path):
+                eval_setup_note = (
+                    f"eval.reference_npz_path not found at {reference_npz_path}; "
+                    "falling back to online reference images from the eval dataset."
+                )
+                reference_npz_path = None
+            elif reference_npz_path is None:
+                eval_setup_note = "Using online reference images from the eval dataset (no eval.reference_npz_path provided)."
+            do_eval = len(missing_fields) == 0
+            if not do_eval:
+                eval_setup_error = (
+                    "Disabling full reconstruction evaluation because: "
+                    + "; ".join(missing_fields)
+                )
     
     # Setup
     global_seed = args.global_seed if args.global_seed is not None else default_seed
@@ -172,6 +317,10 @@ def main():
     torch.cuda.manual_seed_all(seed)
     
     experiment_dir, checkpoint_dir, logger = configure_experiment_dirs(args, rank)
+    if eval_setup_error and rank == 0:
+        logger.warning(eval_setup_error)
+    if eval_setup_note and rank == 0 and do_eval:
+        logger.info(eval_setup_note)
     full_cfg.cmd_args = vars(args)
     full_cfg.experiment_dir = experiment_dir
     full_cfg.checkpoint_dir = checkpoint_dir
@@ -179,6 +328,13 @@ def main():
     # Model
     logger.info("Initializing S-RAE model...")
     model: SRAE = instantiate_from_config(srae_config).to(device)
+    model_image_size = int(getattr(model, "img_size", args.image_size))
+    effective_image_size = model_image_size
+    if args.image_size != effective_image_size and rank == 0:
+        logger.warning(
+            f"Requested --image-size={args.image_size} but S-RAE model uses img_size={effective_image_size}. "
+            f"Using {effective_image_size} to avoid shape mismatch."
+        )
     
     # Only train student (teacher is frozen by default in SRAE)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
@@ -232,10 +388,10 @@ def main():
     scaler, autocast_kwargs = get_autocast_scaler(args)
     
     # Data
-    first_crop_size = 384 if args.image_size == 256 else int(args.image_size * 1.5)
+    first_crop_size = 384 if effective_image_size == 256 else int(effective_image_size * 1.5)
     train_transform = transforms.Compose([
         transforms.Resize(first_crop_size, interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.RandomCrop(args.image_size),
+        transforms.RandomCrop(effective_image_size),
         transforms.ToTensor(),
     ])
     
@@ -249,31 +405,98 @@ def main():
     else:
         loader, sampler = prepare_dataloader(args.data_path, batch_size, num_workers, rank, world_size, transform=train_transform)
     
-    # Eval data
-    eval_loader = None
+    train_dataset = loader.dataset
+    eval_dataset = None
     if do_eval:
         eval_transform = transforms.Compose([
-            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, effective_image_size)),
             transforms.ToTensor(),
         ])
-        
+
         use_hf_eval = args.use_hf_eval or args.hf_eval_load_from_disk is not None
         if use_hf_eval:
             if args.hf_eval_load_from_disk:
-                hf_eval = load_dataset_from_hf(load_from_disk_path=args.hf_eval_load_from_disk, split=args.hf_eval_split)
+                hf_eval_dataset = load_dataset_from_hf(
+                    load_from_disk_path=args.hf_eval_load_from_disk,
+                    split=args.hf_eval_split,
+                )
             else:
-                hf_eval = load_dataset_from_hf(dataset_name=args.hf_dataset_name, split=args.hf_eval_split, cache_dir=args.hf_cache_dir)
-            eval_dataset = HFImageNetDataset(hf_eval, transform=eval_transform)
+                hf_eval_dataset = load_dataset_from_hf(
+                    dataset_name=args.hf_dataset_name,
+                    split=args.hf_eval_split,
+                    cache_dir=args.hf_cache_dir,
+                )
+            eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=eval_transform)
         else:
             eval_dataset = ImageFolder(str(eval_data), transform=eval_transform)
-        
+
         if max_eval_samples is not None and max_eval_samples < len(eval_dataset):
-            from torch.utils.data import Subset
             eval_dataset = Subset(eval_dataset, range(max_eval_samples))
-        
-        eval_sampler = DistributedSampler(eval_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-        eval_loader = DataLoader(eval_dataset, batch_size=batch_size, sampler=eval_sampler, 
-                                num_workers=num_workers, pin_memory=True, drop_last=False)
+
+        if rank == 0:
+            logger.info(f"Evaluation dataset loaded, containing {len(eval_dataset)} images.")
+
+    periodic_eval_enabled = periodic_eval_every_steps > 0
+    periodic_eval_dataset = None
+    if periodic_eval_enabled:
+        try:
+            periodic_eval_transform = transforms.Compose([
+                transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, effective_image_size)),
+                transforms.ToTensor(),
+            ])
+            if periodic_eval_split == "dummy":
+                periodic_eval_dataset = None
+            elif periodic_eval_split == "train":
+                periodic_eval_dataset = train_dataset
+            else:
+                if eval_dataset is not None:
+                    periodic_eval_dataset = eval_dataset
+                elif args.use_hf or args.use_hf_eval or args.hf_eval_load_from_disk is not None:
+                    target_split = args.hf_eval_split
+                    hf_source_path = args.hf_eval_load_from_disk or args.hf_load_from_disk
+                    if hf_source_path:
+                        hf_eval_dataset = load_dataset_from_hf(
+                            load_from_disk_path=hf_source_path,
+                            split=target_split,
+                        )
+                    else:
+                        hf_eval_dataset = load_dataset_from_hf(
+                            dataset_name=args.hf_dataset_name,
+                            split=target_split,
+                            cache_dir=args.hf_cache_dir,
+                        )
+                    periodic_eval_dataset = HFImageNetDataset(hf_eval_dataset, transform=periodic_eval_transform)
+                else:
+                    if args.data_path is None:
+                        raise FileNotFoundError("Validation data path is unavailable for periodic eval split=val.")
+                    val_path = args.data_path.parent / "val"
+                    if not val_path.exists():
+                        val_path = args.data_path.parent / "validation"
+                    if not val_path.exists():
+                        raise FileNotFoundError(
+                            "Could not infer validation path for periodic eval split=val. "
+                            "Expected sibling folder named 'val' or 'validation'."
+                        )
+                    periodic_eval_dataset = ImageFolder(str(val_path), transform=periodic_eval_transform)
+
+            if rank == 0:
+                if periodic_eval_split == "dummy":
+                    sample_desc = "full current batch" if periodic_eval_num_samples <= 0 else str(periodic_eval_num_samples)
+                    logger.info(
+                        f"Periodic rFID enabled every {periodic_eval_every_steps} steps on split=dummy "
+                        f"(num_samples={sample_desc}, batch_size={periodic_eval_batch_size})."
+                    )
+                else:
+                    chosen_samples = len(periodic_eval_dataset) if periodic_eval_num_samples <= 0 else min(periodic_eval_num_samples, len(periodic_eval_dataset))
+                    sample_desc = f"{chosen_samples} (full dataset)" if periodic_eval_num_samples <= 0 else str(chosen_samples)
+                    logger.info(
+                        f"Periodic rFID enabled every {periodic_eval_every_steps} steps on split={periodic_eval_split} "
+                        f"with {sample_desc} samples (batch_size={periodic_eval_batch_size})."
+                    )
+        except Exception as exc:
+            periodic_eval_enabled = False
+            if rank == 0:
+                logger.error(f"Disabling periodic rFID evaluation due to setup error: {exc}")
     
     steps_per_epoch = len(loader)
     if steps_per_epoch == 0:
@@ -310,20 +533,30 @@ def main():
             use_lpips = global_step >= lpips_start_step and perceptual_weight > 0.0
             
             images = images.to(device, non_blocking=True)
-            real_normed = images * 2.0 - 1.0
             
             optimizer.zero_grad(set_to_none=True)
             
             with autocast(**autocast_kwargs):
                 # Forward through S-RAE
                 recon = ddp_model(images)
+                if recon.shape[-2:] != images.shape[-2:]:
+                    recon_target = F.interpolate(images, size=recon.shape[-2:], mode="bicubic", align_corners=False)
+                else:
+                    recon_target = images
+                real_normed = recon_target * 2.0 - 1.0
                 recon_normed = recon * 2.0 - 1.0
                 
                 # Get S-RAE specific losses
                 losses = model.get_last_losses()
-                loss_rec = losses.get('loss_rec', (recon - images).abs().mean())
-                loss_align = losses.get('loss_align', torch.zeros(1, device=device))
-                loss_reg = losses.get('loss_reg', torch.zeros(1, device=device))
+                loss_rec = losses.get('loss_rec', None)
+                if loss_rec is None:
+                    loss_rec = (recon - recon_target).abs().mean()
+                loss_align = losses.get('loss_align', None)
+                if loss_align is None:
+                    loss_align = loss_rec.new_zeros(())
+                loss_reg = losses.get('loss_reg', None)
+                if loss_reg is None:
+                    loss_reg = loss_rec.new_zeros(())
                 loss_align_weight = float(getattr(model, "loss_align_weight", 1.0))
                 loss_reg_weight = float(getattr(model, "loss_reg_weight", 1.0))
                 
@@ -463,15 +696,57 @@ def main():
                     if args.wandb:
                         wandb_utils.log_image(grid, step=global_step)
             
-            # Eval
-            if do_eval and global_step > 0 and global_step % eval_interval == 0:
-                # rFID evaluation (same as RAE)
+            # Full eval
+            if do_eval and (eval_interval > 0 and global_step % eval_interval == 0):
+                logger.info("Starting evaluation...")
+                current_model = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+                eval_models = [(current_model, "model")]
+                for eval_mod, mod_name in eval_models:
+                    eval_stats = evaluate_reconstruction_distributed(
+                        eval_mod,
+                        eval_dataset,
+                        len(eval_dataset),
+                        rank=rank,
+                        world_size=world_size,
+                        device=device,
+                        batch_size=batch_size,
+                        metrics_to_compute=eval_metrics,
+                        experiment_dir=experiment_dir,
+                        global_step=global_step,
+                        autocast_kwargs=autocast_kwargs,
+                        reference_npz_path=reference_npz_path,
+                    )
+                    eval_stats = {f"eval_{mod_name}/{k}": v for k, v in eval_stats.items()} if eval_stats is not None else {}
+                    if args.wandb:
+                        wandb_utils.log(eval_stats, step=global_step)
+                logger.info("Evaluation done.")
+
+            # Periodic eval
+            if periodic_eval_enabled and global_step > 0 and (global_step % periodic_eval_every_steps == 0):
+                eval_model_ref = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+                eval_rfid, eval_error = run_periodic_rfid_eval(
+                    model=eval_model_ref,
+                    split_name=periodic_eval_split,
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                    autocast_kwargs=autocast_kwargs,
+                    num_samples=periodic_eval_num_samples,
+                    eval_batch_size=periodic_eval_batch_size,
+                    eval_dataset=periodic_eval_dataset,
+                    dummy_images=images if periodic_eval_split == "dummy" else None,
+                )
                 if rank == 0:
-                    logger.info("Starting rFID evaluation...")
-                    fid_metric = torch.zeros(1, device=device)  # Placeholder
-                
-                if world_size > 1:
-                    dist.barrier()
+                    if eval_error is not None:
+                        logger.error(f"Periodic rFID evaluation failed at step {global_step}: {eval_error}")
+                    elif eval_rfid is not None:
+                        periodic_stats = {"eval_periodic/rfid": eval_rfid}
+                        logger.info(
+                            f"[Epoch {epoch} | Step {global_step}] "
+                            f"eval_periodic/rfid: {eval_rfid:.6f}"
+                        )
+                        if args.wandb:
+                            wandb_utils.log(periodic_stats, step=global_step)
             
             global_step += 1
         

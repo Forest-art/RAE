@@ -2,8 +2,6 @@ from .ref_iqa import calculate_psnr, calculate_lpips, calculate_ssim
 from .fid import calculate_rfid, calculate_gfid
 import numpy as np
 import torch
-import numpy as np
-import torch
 import torch.distributed as dist
 from PIL import Image
 from torch.cuda.amp import autocast
@@ -12,6 +10,7 @@ from tqdm import tqdm
 from typing import Dict, Optional
 import os
 import sys
+
 def compute_reconstruction_metrics(
     ref_arr: np.ndarray,
     rec_arr: np.ndarray,
@@ -246,27 +245,20 @@ def evaluate_reconstruction_distributed(
     """
     # model.eval()
     use_online_reference = reference_npz_path is None
-    # Save shard NPZ
-    temp_dir = os.path.join(experiment_dir, "eval_npzs")
     if rank == 0:
         print(f"\n[Eval] Starting distributed reconstruction evaluation at step {global_step}")
-        os.makedirs(temp_dir, exist_ok=True)
 
-    # Wait for rank 0 to create the directory before other ranks try to save
-    if world_size > 1:
-        dist.barrier()
-    # print(f"[Rank {rank}] Starting reconstruction...")
     # Each rank processes its shard
     N = min(len(val_dataset), num_samples)
     chunk = N // world_size
 
     if rank < world_size - 1:
         start = rank * chunk
-        end   = (rank + 1) * chunk
+        end = (rank + 1) * chunk
     else:
         # Last rank takes the remainder (and handles N < world_size gracefully)
         start = rank * chunk
-        end   = N
+        end = N
 
     rank_indices = list(range(start, end))
     subset = Subset(val_dataset, rank_indices)
@@ -279,7 +271,6 @@ def evaluate_reconstruction_distributed(
         drop_last=False,
     )
 
-    # Reconstruct images on this rank
     reconstructions = []
     references = [] if use_online_reference else None
     iterator = tqdm(loader, desc=f"[Rank {rank}] Reconstructing", file=sys.stdout) if rank == 0 else loader
@@ -288,70 +279,45 @@ def evaluate_reconstruction_distributed(
         for images, _ in iterator:
             if use_online_reference:
                 ref_np = images.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
-                for img in ref_np:
-                    references.append(img)
+                references.append(ref_np)
             images = images.to(device, non_blocking=True)
             with autocast(**autocast_kwargs):
                 recon = model(images)
+            recon_np = recon.clamp(0, 1).mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+            reconstructions.append(recon_np)
 
-            # Convert to numpy uint8 [H, W, C]
-            recon = recon.clamp(0, 1)
-            recon_np = recon.mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
+    local_recons = np.concatenate(reconstructions, axis=0) if reconstructions else np.empty((0,), dtype=np.uint8)
+    local_refs = np.concatenate(references, axis=0) if (use_online_reference and references) else np.empty((0,), dtype=np.uint8)
 
-            for img in recon_np:
-                reconstructions.append(img)
-
-    if reconstructions:
-        reconstructions = np.stack(reconstructions)
-    else:
-        reconstructions = np.empty((0,), dtype=np.uint8)
-    shard_path = os.path.join(temp_dir, f"recon_{global_step:07d}_{rank:02d}.npz")
-    np.savez(shard_path, arr_0=reconstructions)
-
-    reference_shard_path = None
-    if use_online_reference:
-        if references:
-            references = np.stack(references)
-        else:
-            references = np.empty((0,), dtype=np.uint8)
-        reference_shard_path = os.path.join(temp_dir, f"ref_{global_step:07d}_{rank:02d}.npz")
-        np.savez(reference_shard_path, arr_0=references)
-
-    if rank == 0:
-        print(f"[Rank {rank}] Saved {len(reconstructions)} reconstructions to {shard_path}")
-        if use_online_reference:
-            print(f"[Rank {rank}] Saved {len(references)} online references to {reference_shard_path}")
-
-    # Wait for all ranks to finish reconstruction
     if world_size > 1:
-        dist.barrier()
+        gathered_recons = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(local_recons, gathered_recons, dst=0)
+        if use_online_reference:
+            gathered_refs = [None for _ in range(world_size)] if rank == 0 else None
+            dist.gather_object(local_refs, gathered_refs, dst=0)
+        else:
+            gathered_refs = None
+    else:
+        gathered_recons = [local_recons]
+        gathered_refs = [local_refs] if use_online_reference else None
 
-    # Rank 0 computes metrics
     metrics = None
     if rank == 0:
-        # Combine all reconstruction shards
-        all_recons = []
-        for r in range(world_size):
-            shard_file = os.path.join(temp_dir, f"recon_{global_step:07d}_{r:02d}.npz")
-            shard_data = np.load(shard_file)["arr_0"]
-            if shard_data.size == 0:
-                continue
-            all_recons.append(shard_data)
-
+        all_recons = [
+            shard for shard in gathered_recons
+            if isinstance(shard, np.ndarray) and shard.ndim == 4 and shard.shape[0] > 0
+        ]
         if len(all_recons) == 0:
             raise RuntimeError("No reconstruction samples were generated for evaluation.")
 
         combined_recons = np.concatenate(all_recons, axis=0)[:num_samples]
-        print(f"[Eval] Combined reconstruction NPZ shape: {combined_recons.shape}")
+        print(f"[Eval] Combined reconstruction batch shape: {combined_recons.shape}")
 
         if use_online_reference:
-            all_refs = []
-            for r in range(world_size):
-                ref_shard_file = os.path.join(temp_dir, f"ref_{global_step:07d}_{r:02d}.npz")
-                ref_shard = np.load(ref_shard_file)["arr_0"]
-                if ref_shard.size == 0:
-                    continue
-                all_refs.append(ref_shard)
+            all_refs = [
+                shard for shard in gathered_refs
+                if isinstance(shard, np.ndarray) and shard.ndim == 4 and shard.shape[0] > 0
+            ]
             if len(all_refs) == 0:
                 raise RuntimeError("No online reference samples were collected for evaluation.")
             ref_images = np.concatenate(all_refs, axis=0)[:num_samples]
@@ -362,7 +328,6 @@ def evaluate_reconstruction_distributed(
             ref_images = np.load(reference_npz_path)["arr_0"]
             print(f"[Eval] Loaded reference NPZ from {reference_npz_path}, shape: {ref_images.shape}")
 
-        # Compute metrics
         print("[Eval] Computing metrics...")
         metrics = compute_reconstruction_metrics(
             ref_images,
@@ -370,28 +335,14 @@ def evaluate_reconstruction_distributed(
             device,
             metric_batch_size,
             metrics_to_compute=metrics_to_compute,
-            disable_bar= True, # by default no bar
+            disable_bar=True,
         )
-
-        # Print results
         print(f"[Eval] Step {global_step} Metrics:")
         for key, value in metrics.items():
             print(f"  {key}: {value:.6f}")
 
-        # Cleanup reconstruction shards
-        for r in range(world_size):
-            shard_file = os.path.join(temp_dir, f"recon_{global_step:07d}_{r:02d}.npz")
-            if os.path.exists(shard_file):
-                os.remove(shard_file)
-            if use_online_reference:
-                ref_shard_file = os.path.join(temp_dir, f"ref_{global_step:07d}_{r:02d}.npz")
-                if os.path.exists(ref_shard_file):
-                    os.remove(ref_shard_file)
-
     if world_size > 1:
         dist.barrier()
-    # model.train()
-
     return metrics
 if __name__ == "__main__":
     import argparse

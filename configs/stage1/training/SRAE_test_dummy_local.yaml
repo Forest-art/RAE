@@ -39,7 +39,14 @@ training:
 
 eval:
   eval_interval: 10
+  eval_model: true
+  metrics: ['psnr', 'ssim', 'rfid']
   max_eval_samples: 20
+
+periodic_eval:
+  every_steps: 5
+  split: train
+  num_samples: -1  # <=0 means full split
 
 gan:
   disc:

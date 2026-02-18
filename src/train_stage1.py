@@ -845,10 +845,8 @@ def main():
                 logger.info("Generating EMA samples done.")
             if do_eval and (eval_interval > 0 and global_step % eval_interval == 0):
                 logger.info("Starting evaluation...")
-                eval_models = [(ema_model, "ema")]
-                if eval_model:
-                    current_model = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
-                    eval_models.append((current_model, "model"))
+                current_model = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
+                eval_models = [(current_model, "model")]
                 for eval_mod, mod_name in eval_models:
                     eval_stats = evaluate_reconstruction_distributed(
                         eval_mod,
@@ -869,7 +867,7 @@ def main():
                         wandb_utils.log(eval_stats, step=global_step)
                 logger.info("Evaluation done.")
             if periodic_eval_enabled and global_step > 0 and (global_step % periodic_eval_every_steps == 0):
-                eval_model_ref = ema_model
+                eval_model_ref = ddp_model.module if isinstance(ddp_model, DDP) else ddp_model
                 eval_rfid, eval_error = run_periodic_rfid_eval(
                     model=eval_model_ref,
                     split_name=periodic_eval_split,
