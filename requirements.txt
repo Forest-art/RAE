@@ -8,3 +8,5 @@ omegaconf==2.3.0
 numpy==1.26.0
 torchmetrics
 torch-fidelity
+datasets
+pillow

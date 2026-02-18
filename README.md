@@ -26,6 +26,20 @@ uv pip install torch==2.8.0 torchvision torchaudio --index-url https://download.
 uv pip install -r requirements.txt
 ```
 
+## Local Smoke Test (dummy_data)
+
+Minimal CPU-friendly smoke test that exercises the dummy HF dataset + dataloader.
+
+```bash
+uv pip install -r requirements.txt
+uv pip install datasets pillow
+
+bash scripts/smoke_dummy.sh
+```
+
+If your login node lacks `torch`/`torchvision`, run the same command on a GPU node.
+On clusters, a minimal Slurm batch job can call `bash scripts/smoke_dummy.sh`.
+
 ## Data And Pretrained Models
 
 ### Download pretrained collections
