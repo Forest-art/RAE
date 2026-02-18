@@ -87,6 +87,7 @@ class SRAE(nn.Module):
 
         self.teacher_prefix_tokens = 1 + int(getattr(self.teacher.config, "num_register_tokens", 0))
         self.student_prefix_tokens = 1 + int(getattr(self.student_encoder.config, "num_register_tokens", 0))
+        self._freeze_unused_student_params()
 
         # RAE-aligned encoder preprocessing (resize + mean/std normalization).
         processor = self._load_image_processor(dinov2_model_name)
@@ -167,6 +168,12 @@ class SRAE(nn.Module):
         print(f"  - Bottleneck dim: {bottleneck_dim}")
         print(f"  - Decoder dim: {decoder_dim}")
         print(f"  - Mask ratio: {mask_ratio}")
+
+    def _freeze_unused_student_params(self) -> None:
+        # We do custom MAE-style masking outside HF forward, so this token is unused by design.
+        mask_token = getattr(self.student_encoder.embeddings, "mask_token", None)
+        if isinstance(mask_token, torch.nn.Parameter):
+            mask_token.requires_grad_(False)
 
     @staticmethod
     def _load_image_processor(model_name: str):
@@ -336,6 +343,9 @@ class SRAE(nn.Module):
         
         # Pass through transformer
         hidden_states = self.student_encoder.encoder(x_full).last_hidden_state
+        # Keep parity with HF Dinov2Model forward by applying final layernorm.
+        if hasattr(self.student_encoder, "layernorm") and self.student_encoder.layernorm is not None:
+            hidden_states = self.student_encoder.layernorm(hidden_states)
         
         # Extract patch tokens (exclude cls/register tokens)
         patch_tokens = hidden_states[:, prefix_tokens:]  # [B, N_visible, D]
