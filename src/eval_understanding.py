@@ -47,6 +47,13 @@ def parse_args():
     parser.add_argument("--knn-k", type=int, nargs="+", default=[1, 5, 10, 20, 100, 200], help="K values for KNN")
     parser.add_argument("--linear-epochs", type=int, default=100, help="Linear probe epochs")
     parser.add_argument("--linear-lr", type=float, default=0.001, help="Linear probe learning rate")
+    parser.add_argument(
+        "--feature-pool",
+        type=str,
+        default="avg",
+        choices=["avg", "flatten", "cls"],
+        help="How to turn token/feature-map outputs into vectors. 'avg' is memory-safe and recommended.",
+    )
     
     args = parser.parse_args()
     return args
@@ -63,7 +70,7 @@ def shard_dataset_for_rank(dataset, rank: int, world_size: int, max_samples: int
 
 
 @torch.no_grad()
-def get_encoder_dim(model, device):
+def get_encoder_dim(model, device, feature_pool: str = "avg"):
     """Infer encoder output dimension."""
     dummy_input = torch.randn(1, 3, 224, 224).to(device)
     
@@ -77,7 +84,19 @@ def get_encoder_dim(model, device):
         if isinstance(z, dict):
             z = z.get('latent', z.get('z', z))
     
-    if z.dim() > 2:
+    if z.dim() == 4:
+        if feature_pool == "flatten":
+            z = z.flatten(1)
+        else:
+            z = z.mean(dim=(-2, -1))
+    elif z.dim() == 3:
+        if feature_pool == "flatten":
+            z = z.flatten(1)
+        elif feature_pool == "cls":
+            z = z[:, 0]
+        else:
+            z = z.mean(dim=1)
+    elif z.dim() > 2:
         z = z.flatten(1)
     
     return z.shape[1]
@@ -118,7 +137,7 @@ def main():
         print("Model loaded successfully")
     
     # Get encoder dimension
-    encoder_dim = get_encoder_dim(model, device)
+    encoder_dim = get_encoder_dim(model, device, args.feature_pool)
     if rank == 0:
         print(f"Encoder dimension: {encoder_dim}")
     
@@ -185,6 +204,7 @@ def main():
                 k=max(args.knn_k),
                 distance="cosine",
                 device=device,
+                feature_pool=args.feature_pool,
             )
             
             knn_results = knn_evaluator.run_full_evaluation(
@@ -216,6 +236,7 @@ def main():
                 lr=args.linear_lr,
                 batch_size=args.batch_size,
                 num_workers=args.num_workers,
+                feature_pool=args.feature_pool,
             )
             
             linear_results = linear_evaluator.run_full_evaluation(

@@ -32,14 +32,14 @@ stage_1:
     teacher_output_type: "cls"  # "cls" or "patch"
 
 training:
-  epochs: 100
+  epochs: 16
   ema_decay: 0.9978
   global_batch_size: 256
   rec_loss_mode: pixel_l1  # options: pixel_l1 (RAE-aligned), masked_mse (original MAE-style)
   num_workers: 8
   clip_grad: 0.0
   log_interval: 100
-  checkpoint_interval: 10
+  checkpoint_interval: 1 # every 1 epoch
   sample_every: 2500
   optimizer:
     lr: 2.0e-4
@@ -48,7 +48,7 @@ training:
   scheduler:
     type: cosine
     warmup_epochs: 1
-    decay_end_epoch: 100
+    decay_end_epoch: 16
     base_lr: 2.0e-4
     final_lr: 2.0e-5
     warmup_from_zero: true
@@ -81,7 +81,7 @@ gan:
     scheduler:
       type: cosine
       warmup_epochs: 1
-      decay_end_epoch: 100
+      decay_end_epoch: 16
       base_lr: 2.0e-4
       final_lr: 2.0e-5
       warmup_from_zero: true

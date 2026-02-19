@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from typing import Dict, Optional, Tuple
 
@@ -28,6 +28,7 @@ class LinearProbeEvaluator:
         weight_decay: float = 0.0,
         batch_size: int = 256,
         num_workers: int = 4,
+        feature_pool: str = "avg",
     ):
         self.encoder_dim = encoder_dim
         self.num_classes = num_classes
@@ -37,9 +38,25 @@ class LinearProbeEvaluator:
         self.weight_decay = weight_decay
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.feature_pool = feature_pool
         
         # Linear classifier
         self.classifier = nn.Linear(encoder_dim, num_classes).to(device)
+
+    def _pool_features(self, z: torch.Tensor) -> torch.Tensor:
+        if z.dim() == 4:
+            if self.feature_pool == "flatten":
+                return z.flatten(1)
+            return z.mean(dim=(-2, -1))
+        if z.dim() == 3:
+            if self.feature_pool == "flatten":
+                return z.flatten(1)
+            if self.feature_pool == "cls":
+                return z[:, 0]
+            return z.mean(dim=1)
+        if z.dim() > 2:
+            return z.flatten(1)
+        return z
 
     @staticmethod
     def _get_dist_rank_world() -> Tuple[int, int]:
@@ -128,9 +145,7 @@ class LinearProbeEvaluator:
                 if isinstance(z, dict):
                     z = z.get('latent', z.get('z', z))
             
-            # Flatten if needed
-            if z.dim() > 2:
-                z = z.flatten(1)
+            z = self._pool_features(z)
 
             local_features.append(z.detach().cpu())
             local_labels.append(labels.detach().to(dtype=torch.long).cpu())
@@ -187,36 +202,70 @@ class LinearProbeEvaluator:
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.epochs)
         
-        features = features.to(self.device)
-        labels = labels.to(self.device)
-        
         history = {
             'train_acc': [],
             'val_acc': [],
         }
+
+        train_dataset = TensorDataset(features, labels)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        val_loader = None
+        if val_features is not None and val_labels is not None:
+            val_dataset = TensorDataset(val_features, val_labels)
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=True,
+                drop_last=False,
+            )
         
         for epoch in range(self.epochs):
             # Train
             self.classifier.train()
-            logits = self.classifier(features)
-            loss = F.cross_entropy(logits, labels)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            train_correct = 0
+            train_total = 0
+            for feat_batch, label_batch in train_loader:
+                feat_batch = feat_batch.to(self.device, non_blocking=True)
+                label_batch = label_batch.to(self.device, non_blocking=True)
+
+                logits = self.classifier(feat_batch)
+                loss = F.cross_entropy(logits, label_batch)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                preds = logits.argmax(dim=1)
+                train_correct += (preds == label_batch).sum().item()
+                train_total += label_batch.numel()
             scheduler.step()
             
             # Evaluate
             with torch.no_grad():
                 self.classifier.eval()
-                train_preds = self.classifier(features).argmax(dim=1)
-                train_acc = (train_preds == labels).float().mean().item()
+                train_acc = float(train_correct) / max(1, train_total)
                 history['train_acc'].append(train_acc)
                 
-                if val_features is not None and val_labels is not None:
-                    val_logits = self.classifier(val_features.to(self.device))
-                    val_preds = val_logits.argmax(dim=1)
-                    val_acc = (val_preds == val_labels.to(self.device)).float().mean().item()
+                if val_loader is not None:
+                    val_correct = 0
+                    val_total = 0
+                    for feat_batch, label_batch in val_loader:
+                        feat_batch = feat_batch.to(self.device, non_blocking=True)
+                        label_batch = label_batch.to(self.device, non_blocking=True)
+                        val_logits = self.classifier(feat_batch)
+                        val_preds = val_logits.argmax(dim=1)
+                        val_correct += (val_preds == label_batch).sum().item()
+                        val_total += label_batch.numel()
+                    val_acc = float(val_correct) / max(1, val_total)
                     history['val_acc'].append(val_acc)
                 else:
                     val_acc = None
@@ -246,18 +295,33 @@ class LinearProbeEvaluator:
             metrics: dict with top1 and top5 accuracy
         """
         self.classifier.eval()
-        features = features.to(self.device)
-        labels = labels.to(self.device)
-        
-        logits = self.classifier(features)
-        
-        # Top-1 accuracy
-        preds = logits.argmax(dim=1)
-        top1_acc = (preds == labels).float().mean().item()
-        
-        # Top-5 accuracy
-        top5_preds = logits.topk(5, dim=1).indices
-        top5_acc = (top5_preds == labels.unsqueeze(1)).any(dim=1).float().mean().item()
+        dataset = TensorDataset(features, labels)
+        loader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        top1_correct = 0
+        top5_correct = 0
+        total = 0
+        for feat_batch, label_batch in loader:
+            feat_batch = feat_batch.to(self.device, non_blocking=True)
+            label_batch = label_batch.to(self.device, non_blocking=True)
+            logits = self.classifier(feat_batch)
+
+            preds = logits.argmax(dim=1)
+            top1_correct += (preds == label_batch).sum().item()
+
+            top5_preds = logits.topk(min(5, logits.shape[1]), dim=1).indices
+            top5_correct += (top5_preds == label_batch.unsqueeze(1)).any(dim=1).sum().item()
+            total += label_batch.numel()
+
+        top1_acc = float(top1_correct) / max(1, total)
+        top5_acc = float(top5_correct) / max(1, total)
         
         return {
             'top1': top1_acc * 100,

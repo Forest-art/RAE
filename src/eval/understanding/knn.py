@@ -23,16 +23,33 @@ class KNNEvaluator:
         device: str = "cuda",
         batch_size: int = 256,
         num_workers: int = 4,
+        feature_pool: str = "avg",
     ):
         self.k = k
         self.distance = distance
         self.device = device
         self.batch_size = batch_size
         self.num_workers = num_workers
+        self.feature_pool = feature_pool
         
         # Storage for training features
         self.train_features = None
         self.train_labels = None
+
+    def _pool_features(self, z: torch.Tensor) -> torch.Tensor:
+        if z.dim() == 4:
+            if self.feature_pool == "flatten":
+                return z.flatten(1)
+            return z.mean(dim=(-2, -1))
+        if z.dim() == 3:
+            if self.feature_pool == "flatten":
+                return z.flatten(1)
+            if self.feature_pool == "cls":
+                return z[:, 0]
+            return z.mean(dim=1)
+        if z.dim() > 2:
+            return z.flatten(1)
+        return z
 
     @staticmethod
     def _get_dist_rank_world() -> Tuple[int, int]:
@@ -117,9 +134,7 @@ class KNNEvaluator:
                 if isinstance(z, dict):
                     z = z.get('latent', z.get('z', z))
             
-            # Flatten if needed
-            if z.dim() > 2:
-                z = z.flatten(1)
+            z = self._pool_features(z)
             
             # Normalize for cosine similarity
             if self.distance == "cosine":
