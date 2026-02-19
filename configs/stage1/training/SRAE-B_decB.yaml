@@ -13,6 +13,7 @@ stage_1:
     # Bottleneck
     bottleneck_dim: 768
     use_l2_norm: true
+    norm_pix_loss: false
     
     # Projector
     projector_hidden_dim: 4096
@@ -34,6 +35,7 @@ training:
   epochs: 100
   ema_decay: 0.9978
   global_batch_size: 256
+  rec_loss_mode: pixel_l1  # options: pixel_l1 (RAE-aligned), masked_mse (original MAE-style)
   num_workers: 8
   clip_grad: 0.0
   log_interval: 100
@@ -56,7 +58,6 @@ eval:
   eval_interval: 2500
   eval_model: true
   metrics: ['psnr', 'ssim', 'rfid']
-  max_eval_samples: 1000
   # For local ImageFolder eval, set data_path; for HF eval, pass --use-hf-eval.
   # data_path: 'data/imagenet/val/'
 

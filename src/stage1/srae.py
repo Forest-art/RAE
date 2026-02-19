@@ -58,6 +58,8 @@ class SRAE(nn.Module):
         
         # Teacher output type
         teacher_output_type: str = "cls",  # "cls" or "patch"
+        # Reconstruction target normalization (MAE-style); keep False for pixel-domain rFID alignment.
+        norm_pix_loss: bool = False,
     ):
         super().__init__()
         
@@ -68,6 +70,7 @@ class SRAE(nn.Module):
         self.loss_align_weight = loss_align_weight
         self.loss_reg_weight = loss_reg_weight
         self.teacher_output_type = teacher_output_type
+        self.norm_pix_loss = bool(norm_pix_loss)
         
         # ========== Teacher (Frozen DINOv2) ==========
         print(f"Loading Teacher DINOv2 from {dinov2_model_name}...")
@@ -168,6 +171,7 @@ class SRAE(nn.Module):
         print(f"  - Bottleneck dim: {bottleneck_dim}")
         print(f"  - Decoder dim: {decoder_dim}")
         print(f"  - Mask ratio: {mask_ratio}")
+        print(f"  - Norm pixel loss: {self.norm_pix_loss}")
 
     def _freeze_unused_student_params(self) -> None:
         # We do custom MAE-style masking outside HF forward, so this token is unused by design.
@@ -449,10 +453,11 @@ class SRAE(nn.Module):
             )
         target = self.patchify(imgs)  # [B, N, patch_size^2 * 3]
         
-        # Normalize target (similar to MAE)
-        mean = target.mean(dim=-1, keepdim=True)
-        var = target.var(dim=-1, keepdim=True)
-        target = (target - mean) / (var + 1e-6) ** 0.5
+        # Optional MAE-style target normalization. Keep disabled for pixel-domain reconstruction quality.
+        if self.norm_pix_loss:
+            mean = target.mean(dim=-1, keepdim=True)
+            var = target.var(dim=-1, keepdim=True)
+            target = (target - mean) / (var + 1e-6) ** 0.5
         
         # Compute loss only on masked patches
         rec_per_patch = (pred - target) ** 2

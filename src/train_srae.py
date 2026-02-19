@@ -257,6 +257,16 @@ def main():
     ema_decay = float(training_cfg.get("ema_decay", 0.9999))
     num_epochs = int(training_cfg.get("epochs", 100))
     default_seed = int(training_cfg.get("global_seed", 0))
+    raw_rec_loss_mode = str(training_cfg.get("rec_loss_mode", "pixel_l1")).strip().lower()
+    if raw_rec_loss_mode in {"pixel_l1", "pixel", "l1", "full_l1"}:
+        rec_loss_mode = "pixel_l1"
+    elif raw_rec_loss_mode in {"masked_mse", "patch_mse", "mse"}:
+        rec_loss_mode = "masked_mse"
+    else:
+        raise ValueError(
+            f"Unsupported training.rec_loss_mode='{raw_rec_loss_mode}'. "
+            "Expected one of: pixel_l1, masked_mse."
+        )
     
     # Periodic eval config
     periodic_eval_section = full_cfg.get("periodic_eval", None)
@@ -538,6 +548,13 @@ def main():
     
     logger.info(f"Training for {num_epochs} epochs, {steps_per_epoch} steps per epoch")
     logger.info(f"Perceptual weight: {perceptual_weight}, GAN weight: {disc_weight}")
+    logger.info(f"Reconstruction loss mode: {rec_loss_mode} (RAE-compatible is pixel_l1)")
+    loss_rec_weight = float(getattr(model, "loss_rec_weight", 1.0))
+    loss_align_weight = float(getattr(model, "loss_align_weight", 1.0))
+    loss_reg_weight = float(getattr(model, "loss_reg_weight", 1.0))
+    logger.info(
+        f"S-RAE loss weights: rec={loss_rec_weight}, align={loss_align_weight}, reg={loss_reg_weight}"
+    )
     
     for epoch in range(start_epoch, num_epochs):
         ddp_model.train()
@@ -570,17 +587,20 @@ def main():
                 
                 # Get S-RAE specific losses
                 losses = model.get_last_losses()
-                loss_rec = losses.get('loss_rec', None)
-                if loss_rec is None:
-                    loss_rec = (recon - recon_target).abs().mean()
+                loss_rec_masked_mse = losses.get('loss_rec', None)
+                if loss_rec_masked_mse is None:
+                    loss_rec_masked_mse = recon.new_zeros(())
+                loss_rec_pixel_l1 = (recon - recon_target).abs().mean()
+                if rec_loss_mode == "masked_mse":
+                    loss_rec = loss_rec_masked_mse
+                else:
+                    loss_rec = loss_rec_pixel_l1
                 loss_align = losses.get('loss_align', None)
                 if loss_align is None:
                     loss_align = loss_rec.new_zeros(())
                 loss_reg = losses.get('loss_reg', None)
                 if loss_reg is None:
                     loss_reg = loss_rec.new_zeros(())
-                loss_align_weight = float(getattr(model, "loss_align_weight", 1.0))
-                loss_reg_weight = float(getattr(model, "loss_reg_weight", 1.0))
                 
                 # LPIPS loss
                 if use_lpips:
@@ -597,7 +617,7 @@ def main():
                     gan_loss = torch.zeros_like(loss_rec)
                 
                 # Total reconstruction loss
-                recon_total = loss_rec + perceptual_weight * lpips_loss
+                recon_total = loss_rec_weight * loss_rec + perceptual_weight * lpips_loss
                 
                 # Adaptive weight for GAN
                 if use_gan:
@@ -682,6 +702,8 @@ def main():
             # Logging
             epoch_metrics["loss"] += total_loss.detach()
             epoch_metrics["loss_rec"] += loss_rec.detach()
+            epoch_metrics["loss_rec_pixel_l1"] += loss_rec_pixel_l1.detach()
+            epoch_metrics["loss_rec_masked_mse"] += loss_rec_masked_mse.detach()
             epoch_metrics["loss_align"] += loss_align.detach()
             epoch_metrics["loss_reg"] += loss_reg.detach()
             epoch_metrics["lpips"] += lpips_loss.detach()
@@ -692,6 +714,8 @@ def main():
                 stats = {
                     'loss/total': total_loss.item(),
                     'loss/rec': loss_rec.item(),
+                    'loss/rec_pixel_l1': loss_rec_pixel_l1.item(),
+                    'loss/rec_masked_mse': loss_rec_masked_mse.item(),
                     'loss/align': loss_align.item(),
                     'loss/reg': loss_reg.item(),
                     'loss/lpips': lpips_loss.item(),
@@ -776,7 +800,15 @@ def main():
         # Epoch end
         if rank == 0 and num_batches > 0:
             avg_loss = (epoch_metrics['loss'] / num_batches).item()
-            logger.info(f"[Epoch {epoch}] Avg Loss: {avg_loss:.4f}")
+            avg_rec = (epoch_metrics['loss_rec'] / num_batches).item()
+            avg_rec_l1 = (epoch_metrics['loss_rec_pixel_l1'] / num_batches).item()
+            avg_rec_masked = (epoch_metrics['loss_rec_masked_mse'] / num_batches).item()
+            logger.info(
+                f"[Epoch {epoch}] Avg Loss: {avg_loss:.4f}, "
+                f"Avg Rec({rec_loss_mode}): {avg_rec:.4f}, "
+                f"Avg Rec(pixel_l1): {avg_rec_l1:.4f}, "
+                f"Avg Rec(masked_mse): {avg_rec_masked:.4f}"
+            )
         
         # Checkpoint
         if checkpoint_interval > 0 and epoch % checkpoint_interval == 0 and rank == 0:
