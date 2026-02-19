@@ -4,10 +4,10 @@ K-Nearest Neighbors evaluation for encoder representations.
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Dict, Tuple, Optional
-import numpy as np
 
 
 class KNNEvaluator:
@@ -33,6 +33,46 @@ class KNNEvaluator:
         # Storage for training features
         self.train_features = None
         self.train_labels = None
+
+    @staticmethod
+    def _get_dist_rank_world() -> Tuple[int, int]:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank(), dist.get_world_size()
+        return 0, 1
+
+    @staticmethod
+    def _gather_local_tensors_to_rank0(
+        local_features: torch.Tensor, local_labels: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        rank, world_size = KNNEvaluator._get_dist_rank_world()
+        if world_size == 1:
+            return local_features, local_labels
+
+        gathered_features = [None for _ in range(world_size)] if rank == 0 else None
+        gathered_labels = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(local_features, gathered_features, dst=0)
+        dist.gather_object(local_labels, gathered_labels, dst=0)
+
+        if rank != 0:
+            return None, None
+
+        feat_chunks = []
+        label_chunks = []
+        for feat_shard, label_shard in zip(gathered_features, gathered_labels):
+            if not isinstance(feat_shard, torch.Tensor) or not isinstance(label_shard, torch.Tensor):
+                continue
+            if feat_shard.numel() == 0 or label_shard.numel() == 0:
+                continue
+            feat_chunks.append(feat_shard)
+            label_chunks.append(label_shard)
+
+        if not feat_chunks:
+            feat_dim = local_features.shape[1]
+            return (
+                torch.empty((0, feat_dim), dtype=local_features.dtype),
+                torch.empty((0,), dtype=torch.long),
+            )
+        return torch.cat(feat_chunks, dim=0), torch.cat(label_chunks, dim=0)
         
     @torch.no_grad()
     def extract_features(
@@ -54,21 +94,23 @@ class KNNEvaluator:
             labels: [N]
         """
         model.eval()
-        all_features = []
-        all_labels = []
+        rank, _ = self._get_dist_rank_world()
+        local_features = []
+        local_labels = []
         
-        for images, labels in tqdm(dataloader, desc="Extracting features", leave=False):
+        iterator = tqdm(dataloader, desc="Extracting features", leave=False, disable=(rank != 0))
+        for images, labels in iterator:
             images = images.to(device)
             
             # Extract latent representation
-            if hasattr(model, 'encode'):
-                # RAE style: encode returns latent
-                z = model.encode(images)
-            elif hasattr(model, 'forward_student'):
+            if hasattr(model, 'forward_student'):
                 # SRAE style: use student encoder without masking
                 z, _, _, _ = model.forward_student(images, mask_ratio=0.0)
                 # Pool features: mean over patches
                 z = z.mean(dim=1)  # [B, bottleneck_dim]
+            elif hasattr(model, 'encode'):
+                # RAE style: encode returns latent
+                z = model.encode(images)
             else:
                 # Generic: try to get encoder output
                 z = model(images)
@@ -82,13 +124,32 @@ class KNNEvaluator:
             # Normalize for cosine similarity
             if self.distance == "cosine":
                 z = F.normalize(z, p=2, dim=1)
-            
-            all_features.append(z.cpu())
-            all_labels.append(labels)
-        
-        features = torch.cat(all_features, dim=0)
-        labels = torch.cat(all_labels, dim=0)
-        
+
+            local_features.append(z.detach().cpu())
+            local_labels.append(labels.detach().to(dtype=torch.long).cpu())
+
+        if local_features:
+            local_features_tensor = torch.cat(local_features, dim=0)
+            local_labels_tensor = torch.cat(local_labels, dim=0)
+            feature_dim = local_features_tensor.shape[1]
+        else:
+            feature_dim = self.train_features.shape[1] if self.train_features is not None else 1
+            local_features_tensor = torch.empty((0, feature_dim), dtype=torch.float32)
+            local_labels_tensor = torch.empty((0,), dtype=torch.long)
+
+        features, labels = self._gather_local_tensors_to_rank0(local_features_tensor, local_labels_tensor)
+
+        if rank != 0:
+            return (
+                torch.empty((0, feature_dim), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.long),
+            )
+
+        if features is None or labels is None or features.numel() == 0:
+            return (
+                torch.empty((0, feature_dim), dtype=torch.float32),
+                torch.empty((0,), dtype=torch.long),
+            )
         return features, labels
     
     def fit(
@@ -196,12 +257,18 @@ class KNNEvaluator:
         Returns:
             results: dict mapping k to metrics
         """
-        print("Extracting training features...")
+        rank, _ = self._get_dist_rank_world()
+        if rank == 0:
+            print("Extracting training features...")
         train_features, train_labels = self.extract_features(model, train_loader)
-        self.fit(train_features, train_labels)
-        
-        print("Extracting validation features...")
+
+        if rank == 0:
+            self.fit(train_features, train_labels)
+            print("Extracting validation features...")
         val_features, val_labels = self.extract_features(model, val_loader)
+
+        if rank != 0:
+            return {}
         
         results = {}
         for k in k_list:

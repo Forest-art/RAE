@@ -86,13 +86,15 @@ def prepare_dataloader(
 ) -> Tuple[DataLoader, DistributedSampler]:
     dataset = ImageFolder(str(data_path), transform=transform)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    # Keep standard large-scale behavior, but avoid zero-batch loaders in tiny smoke datasets.
+    drop_last = len(dataset) >= batch_size
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
         num_workers=workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=drop_last,
     )
     return loader, sampler
 
@@ -118,13 +120,15 @@ def prepare_hf_dataloader(
         Tuple of (DataLoader, DistributedSampler)
     """
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    # Keep standard large-scale behavior, but avoid zero-batch loaders in tiny smoke datasets.
+    drop_last = len(dataset) >= batch_size
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
         num_workers=workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=drop_last,
     )
     return loader, sampler
 

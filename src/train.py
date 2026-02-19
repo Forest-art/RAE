@@ -469,6 +469,7 @@ def main():
                         latent_size,
                         sample_model_kwargs,
                         use_guidance,
+                        null_label,
                         rae, 
                         eval_dataset,
                         len(eval_dataset),

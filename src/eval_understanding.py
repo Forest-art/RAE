@@ -11,7 +11,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 from omegaconf import OmegaConf
@@ -22,7 +23,6 @@ from stage1 import RAE, SRAE
 from eval.understanding import LinearProbeEvaluator, KNNEvaluator
 from utils.model_utils import instantiate_from_config
 from utils.dist_utils import setup_distributed, cleanup_distributed
-from utils.train_utils import center_crop_arr
 
 
 def parse_args():
@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=256, help="Batch size")
     parser.add_argument("--num-workers", type=int, default=8, help="Num workers")
     parser.add_argument("--image-size", type=int, default=224, help="Image size")
+    parser.add_argument("--max-train-samples", type=int, default=-1, help="Use at most this many train samples (<=0 means full).")
+    parser.add_argument("--max-val-samples", type=int, default=-1, help="Use at most this many val samples (<=0 means full).")
     parser.add_argument("--use-hf", action="store_true", help="Use HuggingFace dataset")
     parser.add_argument("--hf-split", type=str, default="validation", help="HF split")
     parser.add_argument("--output", type=str, default="understanding_results.json", help="Output file")
@@ -50,16 +52,26 @@ def parse_args():
     return args
 
 
+def shard_dataset_for_rank(dataset, rank: int, world_size: int, max_samples: int = -1):
+    total = len(dataset)
+    if max_samples is not None and max_samples > 0:
+        total = min(total, max_samples)
+    indices = list(range(total))
+    if world_size <= 1:
+        return Subset(dataset, indices)
+    return Subset(dataset, indices[rank::world_size])
+
+
 @torch.no_grad()
 def get_encoder_dim(model, device):
     """Infer encoder output dimension."""
     dummy_input = torch.randn(1, 3, 224, 224).to(device)
     
-    if hasattr(model, 'encode'):
-        z = model.encode(dummy_input)
-    elif hasattr(model, 'forward_student'):
+    if hasattr(model, 'forward_student'):
         z, _, _, _ = model.forward_student(dummy_input, mask_ratio=0.0)
         z = z.mean(dim=1)
+    elif hasattr(model, 'encode'):
+        z = model.encode(dummy_input)
     else:
         z = model(dummy_input)
         if isinstance(z, dict):
@@ -126,12 +138,11 @@ def main():
         val_dataset = HFImageNetDataset(val_dataset, transform=eval_transform)
     else:
         val_dataset = ImageFolder(args.data_path, transform=eval_transform)
-    
-    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+    val_dataset = shard_dataset_for_rank(val_dataset, rank, world_size, args.max_val_samples)
     val_loader = DataLoader(
         val_dataset,
         batch_size=args.batch_size,
-        sampler=val_sampler,
+        shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=False,
@@ -148,12 +159,11 @@ def main():
             train_dataset = HFImageNetDataset(train_dataset, transform=eval_transform)
         else:
             train_dataset = ImageFolder(args.train_data_path, transform=eval_transform)
-        
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+        train_dataset = shard_dataset_for_rank(train_dataset, rank, world_size, args.max_train_samples)
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            sampler=train_sampler,
+            shuffle=False,
             num_workers=args.num_workers,
             pin_memory=True,
             drop_last=False,
@@ -183,8 +193,10 @@ def main():
                 val_loader=val_loader,
                 k_list=args.knn_k,
             )
-            
-            results['knn'] = {f"k={k}": v for k, v in knn_results.items()}
+            if rank == 0 and knn_results:
+                results['knn'] = {f"k={k}": v for k, v in knn_results.items()}
+        if world_size > 1:
+            dist.barrier()
     
     # Linear Probing Evaluation
     if args.eval_linear:
@@ -211,8 +223,10 @@ def main():
                 train_loader=train_loader,
                 val_loader=val_loader,
             )
-            
-            results['linear_probe'] = linear_results
+            if rank == 0 and linear_results:
+                results['linear_probe'] = linear_results
+        if world_size > 1:
+            dist.barrier()
     
     # Save results
     if rank == 0:

@@ -85,6 +85,7 @@ Stage-1 training scripts (`train_stage1.py`, `train_srae.py`) also support Huggi
 ### Evaluation And Utilities
 
 - `src/eval_understanding.py`: encoder understanding evaluation (KNN / linear probe).
+- `src/benchmark_stage1_quick.py`: quick Stage-1 multi-model benchmark (reconstruction + understanding), supports multi-GPU.
 - `src/calculate_stat.py`: latent mean/variance estimation for normalization stats.
 - `pack_images.py`: pack image folders to `.npz`.
 - `scripts/create_dummy_data.py`: create local dummy HF dataset.
@@ -264,7 +265,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
 Linear probe:
 
 ```bash
-python src/eval_understanding.py \
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/eval_understanding.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
   --checkpoint ckpts/stage1/<exp>/checkpoints/ep-0000010.pt \
   --train-data-path /path/to/imagenet/train \
@@ -280,7 +282,8 @@ python src/eval_understanding.py \
 KNN:
 
 ```bash
-python src/eval_understanding.py \
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/eval_understanding.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
   --checkpoint ckpts/stage1/<exp>/checkpoints/ep-0000010.pt \
   --train-data-path /path/to/imagenet/train \
@@ -295,7 +298,8 @@ python src/eval_understanding.py \
 Run both:
 
 ```bash
-python src/eval_understanding.py \
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/eval_understanding.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
   --checkpoint ckpts/stage1/<exp>/checkpoints/ep-0000010.pt \
   --train-data-path /path/to/imagenet/train \
@@ -305,7 +309,64 @@ python src/eval_understanding.py \
   --output results_understanding.json
 ```
 
-### 2. FID with ADM evaluator
+### 2. Quick Stage-1 benchmark (RAE/SRAE multi-model)
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/benchmark_stage1_quick.py \
+  --model rae::configs/stage1/training/DINOv2-B_decB.yaml::ckpts/stage1/<rae_exp>/checkpoints/ep-0000010.pt \
+  --model srae::configs/stage1/training/SRAE-B_decB.yaml::ckpts/stage1/<srae_exp>/checkpoints/ep-0000010.pt \
+  --train-data-path /path/to/imagenet/train \
+  --val-data-path /path/to/imagenet/val \
+  --recon-num-samples 5000 \
+  --understanding-train-samples 50000 \
+  --understanding-val-samples 5000 \
+  --knn-k 1 5 10 20 \
+  --linear-epochs 20 \
+  --output benchmark_stage1_quick.json
+```
+
+### 3. Recommended Pipeline (HF datasets, copy-paste)
+
+Run reconstruction + understanding together for a single checkpoint:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/benchmark_stage1_quick.py \
+  --model srae::configs/stage1/training/SRAE-B_decB.yaml::ckpts/stage1/<srae_exp>/checkpoints/ep-0000010.pt \
+  --use-hf \
+  --hf-train-path /path/to/hf_imagenet \
+  --hf-val-path /path/to/hf_imagenet \
+  --hf-train-split train \
+  --hf-val-split validation \
+  --num-classes 1000 \
+  --recon-num-samples -1 \
+  --understanding-train-samples 50000 \
+  --understanding-val-samples 5000 \
+  --knn-k 1 5 10 20 \
+  --linear-epochs 20 \
+  --output srae_stage1_eval.json
+```
+
+Run generation sampling for Stage-2:
+
+```bash
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/sample_ddp.py \
+  --config configs/stage2/sampling/ImageNet256/DiTDHXL-DINOv2-B.yaml \
+  --sample-dir samples \
+  --num-fid-samples 50000 \
+  --per-proc-batch-size 125 \
+  --label-sampling equal \
+  --precision fp32
+```
+
+Important:
+
+- Keep `--num-classes` consistent with dataset labels (ImageNet-1K uses `1000`).
+- `--recon-num-samples -1` means full-split reconstruction evaluation.
+
+### 4. FID with ADM evaluator
 
 ```bash
 git clone https://github.com/openai/guided-diffusion.git

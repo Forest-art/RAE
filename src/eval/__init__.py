@@ -64,6 +64,7 @@ def evaluate_generation_distributed(
     latent_size, # for noise 
     additional_model_kwargs,
     use_guidance: bool,
+    null_label: Optional[int],
     rae, 
     val_dataset,
     num_samples: int,
@@ -140,13 +141,15 @@ def evaluate_generation_distributed(
             y = label.to(device)
             if use_guidance:
                 z = torch.cat([z, z], dim=0)
+                if null_label is None:
+                    raise ValueError("null_label must be provided when use_guidance=True.")
                 y_null = torch.full((n,), null_label, device=device)
                 y = torch.cat([y, y_null], dim=0)
             model_kwargs = dict(y=y, **additional_model_kwargs)
             with autocast(**autocast_kwargs):
                 samples = sample_fn(z, model_fn, **model_kwargs)[-1]
                 if use_guidance:
-                    samples = samples.chunk(2, dim = 0)
+                    samples, _ = samples.chunk(2, dim=0)
                 samples = rae.decode(samples).clamp(0,1)
             gen_np = samples.mul(255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
             for img in gen_np:
