@@ -51,21 +51,19 @@ hf download nyu-visionx/RAE-collections --local-dir models
 
 ### Dataset format
 
-For local training/evaluation, `--data-path` should point to an ImageFolder-style directory:
+Default data format in this repo is HuggingFace `datasets` saved by `save_to_disk`.
+Use one dataset root for both train/validation splits:
 
 ```text
-/path/to/imagenet/
+/path/to/hf_imagenet/
+  dataset_dict.json
   train/
-    class_000/
-    class_001/
-    ...
-  val/
-    class_000/
-    class_001/
-    ...
+  validation/
+  ...
 ```
 
-Stage-1 training scripts (`train_stage1.py`, `train_srae.py`) also support HuggingFace datasets via `--use-hf`.
+Expected columns are `image` and `label`.
+All Stage-1 training/evaluation commands below use `--use-hf` + `--hf-load-from-disk` style arguments.
 
 ## Script Index
 
@@ -124,7 +122,9 @@ export PROJECT=<wandb_project>
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   src/train_stage1.py \
   --config configs/stage1/training/DINOv2-B_decB.yaml \
-  --data-path /path/to/imagenet/train \
+  --use-hf \
+  --hf-load-from-disk /path/to/hf_imagenet \
+  --hf-split train \
   --results-dir ckpts/stage1 \
   --image-size 256 \
   --precision bf16
@@ -172,7 +172,12 @@ Notes:
 torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   src/train_srae.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
-  --data-path /path/to/imagenet/train \
+  --use-hf \
+  --hf-load-from-disk /path/to/hf_imagenet \
+  --hf-split train \
+  --use-hf-eval \
+  --hf-eval-load-from-disk /path/to/hf_imagenet \
+  --hf-eval-split validation \
   --results-dir ckpts/stage1 \
   --image-size 256 \
   --precision bf16
@@ -181,12 +186,14 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
 HuggingFace dataset example:
 
 ```bash
-python src/train_srae.py \
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/train_srae.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
   --use-hf \
-  --hf-dataset-name imagenet-1k \
+  --hf-load-from-disk /path/to/hf_imagenet \
   --hf-split train \
   --use-hf-eval \
+  --hf-eval-load-from-disk /path/to/hf_imagenet \
   --hf-eval-split validation \
   --results-dir ckpts/stage1
 ```
@@ -212,6 +219,7 @@ Notes:
 
 - `train.py` currently requires `--compile`.
 - `train.py` supports auto-resume from latest checkpoint in the experiment folder.
+- `train.py` currently reads ImageFolder (`--data-path`). If your source is HF `load_from_disk`, export train images once before Stage-2 training.
 
 ## Reconstruction And Sampling
 
@@ -236,6 +244,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --num-samples 50000 \
   --precision fp32
 ```
+
+Note: `stage1_sample_ddp.py` currently reads ImageFolder input (`--data-path`).
 
 ### Stage-2 quick sampling
 
@@ -269,8 +279,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   src/eval_understanding.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
   --checkpoint ckpts/stage1/<exp>/checkpoints/ep-0000010.pt \
-  --train-data-path /path/to/imagenet/train \
-  --data-path /path/to/imagenet/val \
+  --use-hf \
+  --train-data-path /path/to/hf_imagenet \
+  --data-path /path/to/hf_imagenet \
+  --hf-split validation \
   --num-classes 1000 \
   --eval-linear \
   --linear-epochs 100 \
@@ -286,8 +298,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   src/eval_understanding.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
   --checkpoint ckpts/stage1/<exp>/checkpoints/ep-0000010.pt \
-  --train-data-path /path/to/imagenet/train \
-  --data-path /path/to/imagenet/val \
+  --use-hf \
+  --train-data-path /path/to/hf_imagenet \
+  --data-path /path/to/hf_imagenet \
+  --hf-split validation \
   --num-classes 1000 \
   --eval-knn \
   --knn-k 1 5 10 20 100 200 \
@@ -302,8 +316,11 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   src/eval_understanding.py \
   --config configs/stage1/training/SRAE-B_decB.yaml \
   --checkpoint ckpts/stage1/<exp>/checkpoints/ep-0000010.pt \
-  --train-data-path /path/to/imagenet/train \
-  --data-path /path/to/imagenet/val \
+  --use-hf \
+  --train-data-path /path/to/hf_imagenet \
+  --data-path /path/to/hf_imagenet \
+  --hf-split validation \
+  --num-classes 1000 \
   --eval-linear \
   --eval-knn \
   --output results_understanding.json
@@ -316,8 +333,12 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   src/benchmark_stage1_quick.py \
   --model rae::configs/stage1/training/DINOv2-B_decB.yaml::ckpts/stage1/<rae_exp>/checkpoints/ep-0000010.pt \
   --model srae::configs/stage1/training/SRAE-B_decB.yaml::ckpts/stage1/<srae_exp>/checkpoints/ep-0000010.pt \
-  --train-data-path /path/to/imagenet/train \
-  --val-data-path /path/to/imagenet/val \
+  --use-hf \
+  --hf-train-path /path/to/hf_imagenet \
+  --hf-val-path /path/to/hf_imagenet \
+  --hf-train-split train \
+  --hf-val-split validation \
+  --num-classes 1000 \
   --recon-num-samples 5000 \
   --understanding-train-samples 50000 \
   --understanding-val-samples 5000 \
@@ -394,6 +415,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --image-size 256 \
   --precision fp32
 ```
+
+Note: `calculate_stat.py` currently reads ImageFolder input (`--data-path`).
 
 ### Pack image folders into `.npz`
 
